@@ -54,7 +54,7 @@ class Stereo3D(pl.LightningModule):
 
     def __init__(self, hparams, log_dir=None):
         super().__init__()
-        self.hparams = hparams
+        # self.hparams = hparams
         self.flip=torchvision.transforms.RandomHorizontalFlip(p=1)
         #self.psf_experiment=psf_experiment(self.hparams.image_sz)
         self.save_hyperparameters(copy.deepcopy(hparams))
@@ -71,6 +71,17 @@ class Stereo3D(pl.LightningModule):
         }
 
         self.log_dir = log_dir
+
+
+    def train_dataloader(self):
+        if self.train_dataloader_obj is None:
+            raise ValueError("train_dataloader_obj has not been set.")
+        return self.train_dataloader_obj
+
+    def val_dataloader(self):
+        if self.val_dataloader_obj is None:
+            raise ValueError("val_dataloader_obj has not been set.")
+        return self.val_dataloader_obj
        
     def set_image_size(self, image_sz):
         self.hparams.image_sz = image_sz
@@ -83,31 +94,43 @@ class Stereo3D(pl.LightningModule):
         self.camera_left.set_image_size(image_sz)
         self.camera_right.set_image_size(image_sz)
 
-    # learning rate warm-up
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx, optimizer_closure=None, on_tpu=False,
-                       using_native_amp=False, using_lbfgs=False):
+    # # learning rate warm-up
+    # def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx, optimizer_closure=None, on_tpu=False,
+    #                    using_native_amp=False, using_lbfgs=False):
         
-        # warm up lr
-        if self.trainer.global_step < 4000:
-            lr_scale = min(1., float(self.trainer.global_step + 1) / 4000.)
-            lr_scale_optics = lr_scale = min(1., float(self.trainer.global_step + 1) / 400.)
-            optimizer.param_groups[0]['lr'] = lr_scale_optics * self.hparams.optics_lr
-            optimizer.param_groups[1]['lr'] = lr_scale_optics * self.hparams.optics_lr
-            optimizer.param_groups[2]['lr'] = lr_scale * self.hparams.cnn_lr
-            optimizer.param_groups[3]['lr'] = lr_scale * self.hparams.depth_lr
-        # update params
-        optimizer.step()
-        optimizer.zero_grad()
+    #     # warm up lr
+    #     if self.trainer.global_step < 4000:
+    #         lr_scale = min(1., float(self.trainer.global_step + 1) / 4000.)
+    #         lr_scale_optics = lr_scale 
+    #         optimizer.param_groups[0]['lr'] = lr_scale_optics * self.hparams.optics_lr
+    #         optimizer.param_groups[1]['lr'] = lr_scale_optics * self.hparams.optics_lr
+    #         optimizer.param_groups[2]['lr'] = lr_scale * self.hparams.cnn_lr
+    #         optimizer.param_groups[3]['lr'] = lr_scale * self.hparams.depth_lr
+    #     # update params
+       
+    #     # if optimizer_closure is not None:
+    #     #     optimizer_closure()
+    #     optimizer.step(optimizer_closure)
+    #     optimizer.zero_grad()
 
     def configure_optimizers(self):
-        params = [
+        optimizer = torch.optim.Adam([
             {'params': self.camera_left.parameters(), 'lr': self.hparams.optics_lr},
             {'params': self.camera_right.parameters(), 'lr': self.hparams.optics_lr},
             {'params': self.decoder.parameters(), 'lr': self.hparams.cnn_lr},
             {'params': self.matching.parameters(), 'lr': self.hparams.depth_lr},
-        ]
-        optimizer = torch.optim.Adam(params)
-        return optimizer
+        ])
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: min(1., float(step + 1) / 4000.)  # Warm-up 4000 steps
+        )
+        
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': scheduler,
+            'monitor': 'val_loss'  
+        }
     
     def training_step(self, samples, batch_idx):
         
@@ -255,7 +278,7 @@ class Stereo3D(pl.LightningModule):
                 self.__log_images(outputs, target_images_left, target_depthmaps, 
                                   target_images_left_m, target_depthmaps_m, 'validation4')
            
-    def validation_epoch_end(self,outputs):
+    def on_validation_epoch_end(self):
         
         outputs=self.outputs
         with torch.no_grad():

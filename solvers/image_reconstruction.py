@@ -151,12 +151,15 @@ except ImportError:
     from torch.fft import irfft
     from torch.fft import rfft
     def rfft(x, d):
+        x = x.float()
         t=torch.fft.fft2(x, dim = (-d,-1))
         return torch.stack((t.real, t.imag), -1)
     def irfft(x, d, signal_sizes):
+        x = x.float()
         t = torch.fft.ifft2(torch.complex(x[:,:,:,:,0], x[:,:,:,:,1]),dim = (-d,-1))
         return t.real #irfft2(torch.complex(x[:,:,0], x[:,:,1]), s = signal_sizes, dim = (-d))
     def irfft_5(x, d, signal_sizes):
+        x = x.float()
         t = torch.fft.ifft2(torch.complex(x[:,:,:,:,:,0], x[:,:,:,:,:,1]),dim = (-d,-1))
         return t.real #irfft2(torch.complex(x[:,:,0], x[:,:,1]), s = signal_sizes, dim = (-d))
 #try:

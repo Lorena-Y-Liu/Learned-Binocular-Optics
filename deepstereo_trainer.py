@@ -5,7 +5,7 @@ from argparse import ArgumentParser
 
 import torch
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint,LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import ConcatDataset, DataLoader
 from datasets.stereo_flyingthings import SceneFlow
@@ -152,35 +152,49 @@ def prepare_data(hparams):
 
 def main(args):
 
+
+
+    parser = ArgumentParser(add_help=False)
+    parser = Stereo3D.add_model_specific_args(parser)
+    args = parser.parse_known_args(namespace=args)[0]
     
-    logger = TensorBoardLogger(args.default_root_dir,
-                               name=args.experiment_name)
+
+
+    logger = TensorBoardLogger(
+        save_dir=args.default_root_dir,
+        name=args.experiment_name,
+    )
+
     logmanager_callback = LogManager()
     checkpoint_callback = ModelCheckpoint(
         verbose=True,
         monitor='val_loss',
-        filepath=os.path.join(logger.log_dir, 'checkpoints', '{epoch}-{val_loss:.4f}'),
+        dirpath=os.path.join(logger.log_dir, 'checkpoints', '{epoch}-{val_loss:.4f}'),
         save_top_k=1,
-        period=1,
+        every_n_epochs=1,
         mode='min')
+    
+    lr_monitor = LearningRateMonitor(logging_interval='step')
+
     
     model = Stereo3D(hparams=args, log_dir=logger.log_dir)
     
     model.eval()
     
     train_dataloader, val_dataloader = prepare_data(hparams=args)
+    model.train_dataloader_obj = train_dataloader
+    model.val_dataloader_obj = val_dataloader
 
-    trainer = Trainer.from_argparse_args(
-        args,
+    trainer = Trainer(
         logger=logger,
-        callbacks=[logmanager_callback],
-        checkpoint_callback=checkpoint_callback,
+        callbacks=[logmanager_callback,checkpoint_callback,lr_monitor],
         sync_batchnorm=True,
         benchmark=True,
         val_check_interval= 0.5,
+        precision='16-mixed',
         #gpus=[0,1,2]
     )
-    trainer.fit(model, train_dataloader=train_dataloader, val_dataloaders=val_dataloader)
+    trainer.fit(model,ckpt_path=args.ckpt_path)
     
 
 if __name__ == '__main__':
@@ -190,8 +204,9 @@ if __name__ == '__main__':
     parser.add_argument('--mix_instereo_dataset', dest='mix_instereo_dataset', action='store_true')
     parser.set_defaults(mix_instereo_dataset=False)
     parser.add_argument("--local_rank", type=int)
-    parser = Trainer.add_argparse_args(parser)
-    parser = Stereo3D.add_model_specific_args(parser)
+    parser.add_argument('--ckpt_path', type=str, default=None)
+    # parser = Trainer.add_argparse_args(parser)
+    # parser = Stereo3D.add_model_specific_args(parser)
     #parser.add_argument('--local_rank', default=-1, type=int)
 
     parser.set_defaults(
@@ -200,7 +215,7 @@ if __name__ == '__main__':
         max_epochs=200,
     )
 
-    args = parser.parse_known_args()[0]
+    args = parser.parse_args()
     
 
     main(args)

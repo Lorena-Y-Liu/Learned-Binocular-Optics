@@ -1,13 +1,15 @@
 import os
 import shutil
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.callbacks.base import Callback
+from pytorch_lightning.callbacks import Callback
 
+
+'''
 class LogManager(Callback):
 
     def on_init_end(self, trainer):
         
-        Resume=True
+        Resume=False
         if Resume is True:
             ckpt_dir = 'sampledata/logs/log/version_16/checkpoints'
             #ckpt_dir = '/mnt/ssd2/liuyuhui/checkpoint/version_108/checkpoints'
@@ -70,3 +72,37 @@ class LogManager(Callback):
                     ckpt_path = os.path.join(log_dir, 'checkpoints', 'interrupted_model.ckpt')
                     trainer.save_checkpoint(ckpt_path)
                     print('Saved a checkpoint...')
+
+'''
+
+
+class LogManager(Callback):
+
+
+    def on_exception(self, trainer, pl_module, exception):
+        if trainer.is_global_zero:
+            if isinstance(exception, KeyboardInterrupt):
+                if pl_module.global_rank == 0:
+                    yes = ['yes', 'y']
+                    no = ['no', 'n']
+                    ans = ''
+                    while not (ans in no or ans in yes):
+                        ans = input('Save this run? (Y/N) << ').lower()
+                        log_dir = trainer.logger.log_dir
+                        if ans in no:
+                            shutil.rmtree(log_dir)
+                            print(f'Deleted {log_dir}')
+                            trainer.callbacks = [c for c in trainer.callbacks if not isinstance(c, ModelCheckpoint)]
+                        elif ans in yes:
+                            ckpt_path = os.path.join(log_dir, 'checkpoints', 'interrupted_model.ckpt')
+                            trainer.save_checkpoint(ckpt_path)
+                            print('Saved a checkpoint...')
+
+            elif isinstance(exception, RuntimeError) and 'NaN' in str(exception):
+                print("Detected NaN, saving checkpoint before shutdown...")
+                log_dir = trainer.logger.log_dir
+                ckpt_path = os.path.join(log_dir, f"Nan_Loss_epoch={trainer.current_epoch}.ckpt")
+                trainer.save_checkpoint(ckpt_path)
+
+
+            
