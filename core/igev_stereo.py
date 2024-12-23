@@ -141,7 +141,7 @@ class IGEVStereo(nn.Module):
 
         with autocast(enabled=self.args.mixed_precision):
             xspx = self.spx_2_gru(mask_feat_4, stem_2x)
-            spx_pred = self.spx_gru(xspx)
+            spx_pred = self.spx_gru(xspx) 
             spx_pred = F.softmax(spx_pred, 1)
             up_disp = context_upsample(disp*4., spx_pred).unsqueeze(1)
 

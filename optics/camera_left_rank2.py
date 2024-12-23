@@ -346,7 +346,6 @@ class MixedCamera(BaseCamera):
         prop2 = LeastSamplingASM(self, x, y, z, device)
         U2 = prop2(Ein).cuda()
         self.psf_phase=torch.remainder(torch.angle(U2), 2*torch.pi)
-        print(abs(U2)**2)
         return abs(U2)**2
     def psf_ph(self):
         return self.psf_phase

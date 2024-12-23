@@ -263,7 +263,7 @@ class Stereo3D(pl.LightningModule):
             self.log('validation/mse_image_left_mirror', img_mse_m, on_step=False, on_epoch=True)
             self.log('validation/ssim', calculate_ssim(est_images_left, target_images_left), on_step=False, on_epoch=True)
             self.log('validation/ssim_mirror', calculate_ssim(est_images_left_m, target_images_left_m), on_step=False, on_epoch=True)
-            #print(((est_depthmaps-target_depthmaps)*255).abs().mean())
+            #     (((est_depthmaps-target_depthmaps)*255).abs().mean())
             
             if batch_idx ==0:
                 self.__log_images(outputs, target_images_left, target_depthmaps,
