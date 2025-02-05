@@ -3,7 +3,7 @@ python deepstereo_trainer.py --gpus 4 --experiment_name 'fabrication_mixed_camer
 
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 #os.environ['MASTER_ADDR'] = 'localhost'
 import copy
 from argparse import ArgumentParser
@@ -18,6 +18,7 @@ from debayer import Debayer3x3
 from psf.psf_import import *
 
 from models.recovery2_m import Recovery
+#from models.recovery_base import Recovery
 from util.warp import Warp
 from util.matrix import *
 from core.igev_stereo import IGEVStereo
@@ -485,6 +486,9 @@ class Stereo3D(pl.LightningModule):
         if doe_type=='ring':    
             from optics import camera_left_ring as camera_left
             from optics import camera_right_ring as camera_right
+        if doe_type=='ring_base':    
+            from optics import camera_left_ring as camera_left
+            from optics import camera_left_ring as camera_right
         '''if doe_type=='pixel_wise':
             from optics import camera_left_pw as camera_left
             from optics import camera_right_pw as camera_right'''
@@ -505,7 +509,7 @@ class Stereo3D(pl.LightningModule):
         key.replace('decoder.', '', 1): value 
         for key, value in decoder_ckpt['state_dict'].items() 
         if key.startswith('decoder.')}
-        self.decoder.load_state_dict(decoder_state_dict)
+        self.decoder.load_state_dict(decoder_state_dict)'''
 
         self.matching = torch.nn.DataParallel(self.matching, device_ids=[0])
         self.matching.load_state_dict(torch.load('/mnt/ssd2/liuyuhui/checkpoint/sceneflow.pth'))
@@ -516,7 +520,7 @@ class Stereo3D(pl.LightningModule):
         for param in self.camera_left.parameters():
             param.requires_grad = False
         for param in self.camera_right.parameters():
-            param.requires_grad = False'''
+            param.requires_grad = False
         
 
     def __combine_loss(self, depth_loss,depth_1_loss, image_loss, psf_loss):
@@ -659,6 +663,14 @@ class Stereo3D(pl.LightningModule):
         #pinv_volumes_left=outputs.pinv_volumes_left
         #pinv_volumes_left=(pinv_volumes_left-pinv_volumes_left.min())/(pinv_volumes_left.max()-pinv_volumes_left.min())
         summary = torch.cat([captimgs_left[:,:3,...], captimgs_left_m[:,:3,...]], dim=-2)
+        #est=(est-est.min())/(est.max()-est.min())
+        #target_depthmaps=(target_depthmaps-target_depthmaps.min())/(target_depthmaps.max()-target_depthmaps.min())
+        #est_depthmaps=(est_depthmaps-est_depthmaps.min())/(est_depthmaps.max()-est_depthmaps.min())
+
+        '''psnr=calculate_psnr(target_images_left, est_images_left)
+        rmsed=rmse(target_depthmaps,est)
+        msed=mse(target_depthmaps,est)
+        print(psnr,msed,rmsed)'''
         summary2 = torch.cat([target_images_left, est_images_left, target_depthmaps,est, est_dfd, est_depthmaps], dim=-2)
         summary3 = torch.cat([target_images_left_m, est_images_left_m, target_depthmaps_m, est_m, est_dfd_m, est_depthmaps_m], dim=-2)
         summary = summary[:summary_max_images]
@@ -790,10 +802,10 @@ class Stereo3D(pl.LightningModule):
         parser.add_argument('--summary_track_train_every', type=int, default=500) #1000)
 
         # training parameters
-        parser.add_argument('--cnn_lr', type=float, default=0.5e-3)#0.5e-3)
+        parser.add_argument('--cnn_lr', type=float, default=1e-3)#0.5e-3)
         parser.add_argument('--depth_lr', type=float, default=1e-5)
         parser.add_argument('--optics_lr', type=float, default=0)#0.1e-3)#2e-2)#1e-3)#=0.5e-3
-        parser.add_argument('--batch_sz', type=int, default=1)#10) #6
+        parser.add_argument('--batch_sz', type=int, default=4)#10) #6
         #parser.add_argument('--control_num', type=int, default=5)z
         parser.add_argument('--num_workers', type=int, default=8)
         parser.add_argument('--augment', default=True, action='store_true')
@@ -801,7 +813,7 @@ class Stereo3D(pl.LightningModule):
         # loss parameters
         parser.add_argument('--depth_loss_weight', type=float, default=1)
         parser.add_argument('--depth_1_loss_weight', type=float, default=1)#0.5)
-        parser.add_argument('--image_loss_weight', type=float, default=5)
+        parser.add_argument('--image_loss_weight', type=float, default=10)
         parser.add_argument('--psf_loss_weight', type=float, default=0)
         parser.add_argument('--psf_size', type=int, default=160)
 

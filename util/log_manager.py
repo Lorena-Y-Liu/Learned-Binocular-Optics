@@ -7,9 +7,9 @@ class LogManager(Callback):
 
     def on_init_end(self, trainer):
         
-        Resume=True
+        Resume=False
         if Resume is True:
-            ckpt_dir = 'sampledata/logs/log/version_16/checkpoints'
+            ckpt_dir = 'sampledata/logs/log/version_22/checkpoints'
             #ckpt_dir = '/mnt/ssd2/liuyuhui/checkpoint/version_108/checkpoints'
             #ckpt_dir = os.path.join('sampledata/logs/log/version_108', 'checkpoints')
             print("*"*30)
