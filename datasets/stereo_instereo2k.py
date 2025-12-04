@@ -1,3 +1,9 @@
+"""
+InStereo2K Dataset for Stereo Depth Estimation.
+
+InStereo2K is a large-scale indoor stereo dataset with accurate disparity maps.
+"""
+
 from typing import Tuple
 import os
 import torch
@@ -6,12 +12,6 @@ import imageio
 from torch.utils.data import Dataset
 from datasets.augmentation import RandomTransform
 from kornia.augmentation import CenterCrop
-from kornia.filters import gaussian_blur2d
-import torchvision.utils
-import cv2 
-from torchvision import transforms
-import torch.nn.functional as F
-from torchvision import transforms
 
 # 'left' image has negative disparity.
 #DATA_ROOT = os.path.join('sampledata', 'training_data', 'SceneFlow')

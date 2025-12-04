@@ -74,9 +74,7 @@ class Recovery(nn.Module):
             nn.ReLU(),
             nn.Conv2d(base_ch2, depth_ch, kernel_size=1, bias=True)
         )
-        # --------------------------------------------------------
 
-        # 原始的解码器与其他分支保持不变
         self.input_layers = input_layers
         self.input_layers2 = input_layers2
         self.input_rough_layers = input_rough_layers
@@ -169,6 +167,6 @@ class Recovery(nn.Module):
         outputs = OutputsContainer(
             est_images=est_images,
             est_dfd=est_depthmaps_dfd,
-            est_depthmaps=est_depthmaps
+            est_depthmaps=rough_depth
         )
         return outputs

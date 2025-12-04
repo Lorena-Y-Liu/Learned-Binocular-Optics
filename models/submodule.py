@@ -518,9 +518,7 @@ class SpatialTransformer(nn.Module):
 
         device = left_input.get_device()
         left_y_coordinate = torch.arange(0.0, left_input.size()[3], device=device).repeat(left_input.size()[2])
-        # left_y_coordinate = torch.arange(0.0, left_input.size()[3]).repeat(left_input.size()[2])
         left_y_coordinate = left_y_coordinate.view(left_input.size()[2], left_input.size()[3])
-        #left_y_coordinate = torch.clamp(left_y_coordinate, min=0, max=left_input.size()[3] - 1)
         left_y_coordinate = left_y_coordinate.expand(left_input.size()[0], -1, -1)
 
         right_feature_map = right_input.expand(disparity_samples.size()[1], -1, -1, -1, -1).permute([1, 2, 0, 3, 4])
@@ -552,32 +550,19 @@ def SpatialTransformer_grid(x, y, disp_range_samples):
     mh, mw = torch.meshgrid([torch.arange(0, height, dtype=x.dtype, device=x.device),
                                  torch.arange(0, width, dtype=x.dtype, device=x.device)])  # (H *W)
 
-    # mh, mw = torch.meshgrid([torch.arange(0, height, dtype=x.dtype),
-    #                              torch.arange(0, width, dtype=x.dtype)])  # (H *W)
     mh = mh.reshape(1, 1, height, width).repeat(bs, ndisp, 1, 1)
     mw = mw.reshape(1, 1, height, width).repeat(bs, ndisp, 1, 1)  # (B, D, H, W)
 
     cur_disp_coords_y = mh
     cur_disp_coords_x = mw - disp_range_samples
-    #print('##############3333333', mw, cur_disp_coords_x)
-
-        # print("cur_disp", cur_disp, cur_disp.shape if not isinstance(cur_disp, float) else 0)
-        # print("cur_disp_coords_x", cur_disp_coords_x, cur_disp_coords_x.shape)
-
+    
     coords_x = cur_disp_coords_x / ((width - 1.0) / 2.0) - 1.0  # trans to -1 - 1
     coords_y = cur_disp_coords_y / ((height - 1.0) / 2.0) - 1.0
     grid = torch.stack([coords_x, coords_y], dim=4) #(B, D, H, W, 2)
 
     y_warped = F.grid_sample(y, grid.view(bs, ndisp * height, width, 2), mode='bilinear',
                                padding_mode='zeros', align_corners=True).view(bs, channels, ndisp, height, width)  #(B, C, D, H, W)
-
-
-        # a littel difference, no zeros filling
     x_warped = x.unsqueeze(2).repeat(1, 1, ndisp, 1, 1) #(B, C, D, H, W)
-    # x_warped = x_warped.transpose(0, 1) #(C, B, D, H, W)
-    #     #x1 = x2 + d >= d
-    # x_warped[:, mw < disp_range_samples] = 0
-    # x_warped = x_warped.transpose(0, 1) #(B, C, D, H, W)
 
     return y_warped, x_warped
 

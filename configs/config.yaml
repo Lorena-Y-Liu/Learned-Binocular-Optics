@@ -1,0 +1,138 @@
+# =============================================================================
+# Deep Stereo - Unified Configuration File
+# =============================================================================
+# Usage: Modify parameters in this file to adjust training settings
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Experiment Settings
+# -----------------------------------------------------------------------------
+experiment_name: deep_stereo_training
+checkpoint_path: null  # Path to checkpoint file, e.g., "checkpoints/model.pth"
+
+# -----------------------------------------------------------------------------
+# Optical System Parameters
+# -----------------------------------------------------------------------------
+optics:
+  # DOE type: rank1, rank2, ring
+  doe_type: rank2
+  
+  # DOE initialization method:
+  #   true  - Load from pretrained vectors (doe_vector/x_0_l.pth, etc.)
+  #   false - Use analytical initialization formula
+  use_pretrained_doe: false
+  
+  # Camera type
+  camera_type: mixed
+  
+  # DOE mask parameters
+  mask_sz: 1260
+  mask_pitch: 3.45e-06        # Unit: meters
+  mask_diameter: 0.004347     # Unit: meters
+  mask_upsample_factor: 2
+  
+  # Camera parameters
+  focal_length: 0.035         # Focal length (meters)
+  focal_depth: 1.23           # Left camera focal depth (meters)
+  focal_depth_right: 1.23     # Right camera focal depth (meters)
+  camera_pixel_pitch: 5.86e-06  # Pixel pitch (meters)
+  
+  # Simulation parameters
+  diffraction_efficiency: 0.7
+  full_size: 1200
+  
+  # Noise parameters
+  noise_sigma_min: 0.001
+  noise_sigma_max: 0.005
+  
+  # Additional options
+  bayer: true
+  occlusion: true
+  optimize_optics: true      # Whether to optimize optical parameters
+  psf_jitter: false
+  scale: 1.0
+
+# -----------------------------------------------------------------------------
+# Training Parameters
+# -----------------------------------------------------------------------------
+training:
+  # Learning rates
+  cnn_lr: 5e-4               # CNN network learning rate
+  depth_lr: 1e-4           # Depth estimation learning rate
+  optics_lr: 1e-3              # Optics learning rate (set to 0 to disable)
+  
+  # Batch and data loading
+  batch_sz: 1
+  num_workers: 8
+  
+  # Training settings
+  max_epochs: 100
+  num_steps: 200000
+  augment: true               # Data augmentation
+  mixed_precision: true       # Mixed precision training
+  wdecay: 0.00001             # Weight decay
+  
+  # Random seed
+  seed: 666
+
+# -----------------------------------------------------------------------------
+# Loss Function Weights
+# -----------------------------------------------------------------------------
+loss:
+  depth_loss_weight: 1.0
+  depth_1_loss_weight: 1.0
+  image_loss_weight: 5.0
+  psf_loss_weight: 0.001
+  psf_size: 160
+
+# -----------------------------------------------------------------------------
+# Dataset Parameters
+# -----------------------------------------------------------------------------
+dataset:
+  image_sz: [192, 512]        # Image size [H, W]
+  n_depths: 7                 # Number of depth planes
+  min_depth: 0.67             # Minimum depth (meters)
+  max_depth: 8.0              # Maximum depth (meters)
+  crop_width: 0
+  
+  # Data augmentation parameters
+  img_gamma: null
+  saturation_range: [0.0, 1.4]
+  do_flip: false
+  spatial_scale: [-0.2, 0.4]
+  noyjitter: false
+
+# -----------------------------------------------------------------------------
+# Solver Parameters
+# -----------------------------------------------------------------------------
+solver:
+  reg_tikhonov: 0.1           # Tikhonov regularization
+  model_base_ch: 32           # Model base channels
+  preinverse: true
+  warp_img: true
+
+# -----------------------------------------------------------------------------
+# IGEV Stereo Matching Network Parameters
+# -----------------------------------------------------------------------------
+igev:
+  train_iters: 8             # Training iterations
+  valid_iters: 16             # Validation iterations
+  hidden_dims: [128, 128, 128]
+  corr_implementation: reg    # Options: reg, alt, reg_cuda, alt_cuda
+  shared_backbone: false
+  corr_levels: 2
+  corr_radius: 4
+  n_downsample: 2
+  slow_fast_gru: false
+  n_gru_layers: 3
+  max_disp: 192               # Maximum disparity
+
+# -----------------------------------------------------------------------------
+# Logger Parameters
+# -----------------------------------------------------------------------------
+logger:
+  summary_max_images: 8
+  summary_image_sz: 200
+  summary_mask_sz: 1260
+  summary_depth_every: 2000
+  summary_track_train_every: 100

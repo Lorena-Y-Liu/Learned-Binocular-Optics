@@ -1,12 +1,33 @@
 """
-python deepstereo_trainer.py --gpus 4 --experiment_name 'fabrication_mixed_camera' --occlusion --augment --batch_sz 3 --preinverse --camera_type mixed --optimize_optics --bayer --focal_depth 1.7 --distributed_backend ddp  --max_epochs 1000 --psf_loss_weight 1.00
+Learned Binocular-Encoding Optics for RGBD Imaging.
 
+Official implementation of "Learned binocular-encoding optics for RGBD imaging 
+using joint stereo and focus cues".
+
+Project Page: https://liangxunou.github.io/25liulearned/
+
+This module implements the main Stereo3D PyTorch Lightning model for training
+and inference of a depth-from-defocus stereo system with learnable diffractive
+optical elements (DOE).
+
+Code References:
+    - DOE optimization framework: https://github.com/computational-imaging/DepthFromDefocusWithLearnedOptics
+    - Wave propagation (LS-ASM): https://github.com/whywww/ASASM
+    - Stereo matching (IGEV): https://github.com/gangweix/IGEV
+
+Usage:
+    # Training with config file (recommended):
+    python deepstereo_trainer.py --config configs/config.yaml
+    
+    # Training with command line arguments:
+    python deepstereo_trainer.py --gpus 1 --batch_sz 2 --doe_type rank2
+
+License: MIT
 """
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-#os.environ['MASTER_ADDR'] = 'localhost'
+
 import copy
-from argparse import ArgumentParser
+import os
+from argparse import ArgumentParser, Namespace
 from collections import namedtuple
 import torch.nn.functional as F
 import pytorch_lightning as pl
@@ -17,8 +38,7 @@ import torchvision.utils
 from debayer import Debayer3x3
 from psf.psf_import import *
 
-from models.recovery2_m import Recovery
-#from models.recovery_base import Recovery
+from models.fusion import Recovery
 from util.warp import Warp
 from util.matrix import *
 from core.igev_stereo import IGEVStereo
@@ -28,6 +48,14 @@ from util.fft import crop_psf, fftshift
 from util.helper import crop_boundary, gray_to_rgb, imresize, linear_to_srgb, srgb_to_linear, to_bayer
 from util.loss import Vgg16PerceptualLoss
 import cv2
+
+# Import config module for YAML configuration support
+try:
+    from config import load_config, Config, config_to_namespace
+    CONFIG_AVAILABLE = True
+except ImportError:
+    CONFIG_AVAILABLE = False
+
 try:
     from torch import irfft
     from torch import rfft
@@ -44,29 +72,39 @@ from torch.cuda.amp import GradScaler
 StereoOutputs = namedtuple('StereoOutputs',
                              field_names=['captimgs_left','captimgs_right', 'captimgs_linear_left','captimgs_linear_right',
                                           'captimgs_left_m','captimgs_right_m', 'captimgs_linear_left_m','captimgs_linear_right_m',
-                                          'est_images_left','est_depthmaps','est','est_1', 'est_sq','est_dfd','est_dfd_m',
-                                          'est_images_left_m','est_depthmaps_m','est_m','est_1_m','est_sq_m',
+                                          'est_images_left','est_images_right','est_depthmaps','est','est_1', 'est_sq','est_dfd','est_dfd_m',
+                                          'est_images_left_m','est_images_right_m','est_depthmaps_m','est_m','est_1_m','est_sq_m',
                                           'target_images_left','target_images_right', 
                                           'target_images_left_m','target_images_right_m', 
                                           'norm_max','norm_min','norm_max_m','norm_min_m',
                                           'target_depthmaps','target_roughdepth','target_depthmaps_m','target_roughdepth_m','psf_left','psf_right'])
 
 class Stereo3D(pl.LightningModule):
+    """
+    Main PyTorch Lightning module for Deep Stereo depth estimation.
+    
+    This module combines:
+    - Dual camera simulation with learnable DOE phase masks
+    - Image reconstruction from defocused captures
+    - Stereo matching for disparity estimation
+    - Multi-loss training including perceptual, depth, and PSF regularization
+    
+    Args:
+        hparams: Hyperparameters namespace containing model configuration
+        log_dir: Optional directory for logging outputs
+    """
 
     def __init__(self, hparams, log_dir=None):
         super().__init__()
         self.hparams = hparams
-        self.flip=torchvision.transforms.RandomHorizontalFlip(p=1)
-        #self.psf_experiment=psf_experiment(self.hparams.image_sz)
+        self.flip = torchvision.transforms.RandomHorizontalFlip(p=1)
         self.save_hyperparameters(copy.deepcopy(hparams))
-        #for key in hparams.keys():
-            #self.hparams[key]=copy.deepcopy(hparams[key])
-        
         self.save_hyperparameters(self.hparams)
         self.__build_model()
         
+        # Perceptual loss metrics for image quality evaluation
         self.metrics = {
-            'vgg_image_left': Vgg16PerceptualLoss(),#MeanSquaredError(),
+            'vgg_image_left': Vgg16PerceptualLoss(),
             'vgg_image_left_mirror': Vgg16PerceptualLoss(),
             'vgg_image_right': Vgg16PerceptualLoss(),
         }
@@ -92,10 +130,10 @@ class Stereo3D(pl.LightningModule):
         if self.trainer.global_step < 4000:
             lr_scale = min(1., float(self.trainer.global_step + 1) / 4000.)
             lr_scale_optics = lr_scale = min(1., float(self.trainer.global_step + 1) / 400.)
-            optimizer.param_groups[0]['lr'] = lr_scale_optics * self.hparams.optics_lr
-            optimizer.param_groups[1]['lr'] = lr_scale_optics * self.hparams.optics_lr
-            optimizer.param_groups[2]['lr'] = lr_scale * self.hparams.cnn_lr
-            optimizer.param_groups[3]['lr'] = lr_scale * self.hparams.depth_lr
+            optimizer.param_groups[0]['lr'] = lr_scale_optics * float(self.hparams.optics_lr)
+            optimizer.param_groups[1]['lr'] = lr_scale_optics * float(self.hparams.optics_lr)
+            optimizer.param_groups[2]['lr'] = lr_scale * float(self.hparams.cnn_lr)
+            optimizer.param_groups[3]['lr'] = lr_scale * float(self.hparams.depth_lr)
         # update params
         optimizer.step()
         optimizer.zero_grad()
@@ -116,12 +154,12 @@ class Stereo3D(pl.LightningModule):
         target_images_left = samples['left_image']
         target_images_right = samples['right_image']
 
-        target_depthmaps = samples['unnorm_depthmap']#samples['depthmap']
+        target_depthmaps = samples['unnorm_depthmap']
         target_norm_depthmaps = samples['depthmap']
-        original_depthmaps=samples['original_depth']
-        target_depthmaps_m = samples['unnorm_depthmap_2']#samples['depthmap_2']
+        original_depthmaps = samples['original_depth']
+        target_depthmaps_m = samples['unnorm_depthmap_2']
         target_norm_depthmaps_m = samples['depthmap_2']
-        original_depthmaps_m=samples['original_depth2']
+        original_depthmaps_m = samples['original_depth2']
         disparity = samples['disparity']
         disparity_2 = samples['disparity_2']
 
@@ -146,7 +184,6 @@ class Stereo3D(pl.LightningModule):
 
         logs = {}
         logs.update(loss_logs)
-        #logs.update(misc_logs)
 
         if not self.global_step % self.hparams.summary_track_train_every:
             
@@ -159,22 +196,21 @@ class Stereo3D(pl.LightningModule):
         return data_loss
     
     def on_validation_epoch_start(self) -> None:
-        
+        """Move metrics to device before validation."""
         for metric in self.metrics.values():
-            #metric.reset() 
             metric.to(self.device)
             
     def validation_step(self, samples, batch_idx):
-        
+        """Validation step with metric computation."""
         with torch.no_grad():
             target_images_left = samples['left_image']
             target_images_right = samples['right_image']
             target_depthmaps = samples['unnorm_depthmap']
             target_norm_depthmaps = samples['depthmap']
-            original_depthmaps=samples['original_depth']
+            original_depthmaps = samples['original_depth']
             target_depthmaps_m = samples['unnorm_depthmap_2']
             target_norm_depthmaps_m = samples['depthmap_2']
-            original_depthmaps_m=samples['original_depth2']
+            original_depthmaps_m = samples['original_depth2']
             original_images_left = samples['original_left']
             original_images_right = samples['original_right']
             original_images_left_m = samples['original_left_m']
@@ -183,10 +219,15 @@ class Stereo3D(pl.LightningModule):
             disparity = samples['disparity']
             disparity_2 = samples['disparity_2']
 
-            input_args=[target_images_left,target_images_right,
-                    original_images_left, original_images_right, original_images_left_m, original_images_right_m, 
-                    target_depthmaps,  target_depthmaps_m, target_norm_depthmaps, target_norm_depthmaps_m,
-                    original_depthmaps, original_depthmaps_m ,disparity, disparity_2]
+            input_args = [
+                target_images_left, target_images_right,
+                original_images_left, original_images_right, 
+                original_images_left_m, original_images_right_m,
+                target_depthmaps, target_depthmaps_m, 
+                target_norm_depthmaps, target_norm_depthmaps_m,
+                original_depthmaps, original_depthmaps_m,
+                disparity, disparity_2
+            ]
 
             outputs = self.forward(*input_args)
 
@@ -197,39 +238,35 @@ class Stereo3D(pl.LightningModule):
             est_depthmaps_m = outputs.est_depthmaps_m
             rough_depth = outputs.est
             rough_depth_m = outputs.est_m
-            #est_depthmaps = outputs.est_depthmaps
             target_images_left = outputs.target_images_left
             target_images_left_m = outputs.target_images_left_m
 
             target_depthmaps = outputs.target_depthmaps
             target_depthmaps_m = outputs.target_depthmaps_m
-            #c,d= target_depthmaps.shape[-2:]
-            #scale=self.hparams.scale #1.6
-            target_roughdepth= outputs.target_roughdepth
-            target_roughdepth_m= outputs.target_roughdepth_m
-            #target_roughdepth= F.interpolate(target_depthmaps, size=(int(c/scale), int(d/scale)), mode='bilinear', align_corners=True)
-            self.outputs=outputs
-            #mag = torch.sum(target_roughdepth**2, dim=1).sqrt().unsqueeze(1)
+            target_roughdepth = outputs.target_roughdepth
+            target_roughdepth_m = outputs.target_roughdepth_m
+            self.outputs = outputs
+            
+            # Create valid masks for disparity evaluation
             valid = ((target_roughdepth >= 0.5) & (target_roughdepth < self.hparams.max_disp))
             valid_m = ((target_roughdepth_m >= 0.5) & (target_roughdepth_m < self.hparams.max_disp))
             assert valid.shape == target_roughdepth.shape, [valid.shape, target_roughdepth.shape]
             assert not torch.isinf(target_roughdepth[valid.bool()]).any()
 
-            depth_mse=mse(est_depthmaps, target_depthmaps)
-            depth_epe=mae((est_depthmaps)*255, (target_depthmaps)*255)
-            depth_3px=calculate_3px((est_depthmaps)*255, (target_depthmaps)*255)
-            epe_match=mae(rough_depth[valid.bool()], target_roughdepth[valid.bool()])
-            img_mse=mse(est_images_left, target_images_left)
-            #self.metrics['vgg_image_left'].train_loss(est_images_left, target_images_left)
+            # Compute metrics
+            depth_mse = mse(est_depthmaps, target_depthmaps)
+            depth_epe = mae((est_depthmaps) * 255, (target_depthmaps) * 255)
+            depth_3px = calculate_3px((est_depthmaps) * 255, (target_depthmaps) * 255)
+            epe_match = mae(rough_depth[valid.bool()], target_roughdepth[valid.bool()])
+            img_mse = mse(est_images_left, target_images_left)
 
-            depth_mse_m=mse(est_depthmaps_m, target_depthmaps_m)
-            depth_epe_m=mae((est_depthmaps_m)*255, (target_depthmaps_m)*255)
-            depth_3px_m=calculate_3px((est_depthmaps_m)*255, (target_depthmaps_m)*255)
-            epe_match_m=mae(rough_depth_m[valid.bool()], target_roughdepth_m[valid.bool()])
-            img_mse_m=mse(est_images_left_m, target_images_left_m)
-            #self.metrics['vgg_image_left_mirror'].train_loss(est_images_left_m, target_images_left_m)
+            depth_mse_m = mse(est_depthmaps_m, target_depthmaps_m)
+            depth_epe_m = mae((est_depthmaps_m) * 255, (target_depthmaps_m) * 255)
+            depth_3px_m = calculate_3px((est_depthmaps_m) * 255, (target_depthmaps_m) * 255)
+            epe_match_m = mae(rough_depth_m[valid.bool()], target_roughdepth_m[valid.bool()])
+            img_mse_m = mse(est_images_left_m, target_images_left_m)
             
-            
+            # Log validation metrics
             self.log('validation/mse_depthmap', depth_mse, on_step=False, on_epoch=True)
             self.log('validation/mse_depthmap_m', depth_mse_m, on_step=False, on_epoch=True)
             self.log('validation/depth_epe', depth_epe, on_step=False, on_epoch=True)
@@ -241,20 +278,10 @@ class Stereo3D(pl.LightningModule):
             self.log('validation/mse_image_left_mirror', img_mse_m, on_step=False, on_epoch=True)
             self.log('validation/ssim', calculate_ssim(est_images_left, target_images_left), on_step=False, on_epoch=True)
             self.log('validation/ssim_mirror', calculate_ssim(est_images_left_m, target_images_left_m), on_step=False, on_epoch=True)
-            #print(((est_depthmaps-target_depthmaps)*255).abs().mean())
             
             if batch_idx ==0:
                 self.__log_images(outputs, target_images_left, target_depthmaps,
                                   target_images_left_m, target_depthmaps_m, 'validation')
-            if batch_idx ==1:
-                self.__log_images(outputs, target_images_left, target_depthmaps, 
-                                  target_images_left_m, target_depthmaps_m, 'validation2')
-            if batch_idx ==2:
-                self.__log_images(outputs, target_images_left, target_depthmaps, 
-                                  target_images_left_m, target_depthmaps_m, 'validation3')
-            if batch_idx ==3:
-                self.__log_images(outputs, target_images_left, target_depthmaps, 
-                                  target_images_left_m, target_depthmaps_m, 'validation4')
            
     def validation_epoch_end(self,outputs):
         
@@ -273,17 +300,17 @@ class Stereo3D(pl.LightningModule):
         left_images_linear = srgb_to_linear(left_images)
         right_images_linear = srgb_to_linear(right_images)
         # Currently PSF jittering is supported only for MixedCamera.
-        if torch.tensor(self.hparams.psf_jitter):
+        if self.hparams.psf_jitter:
             # Jitter the PSF on the evaluation as well.
             captimgs_left,  target_volumes_left, _ = self.camera_left.forward_train(left_images_linear, 
                           depthmaps_norm, occlusion=self.hparams.occlusion)
 
             # We don't want to use the jittered PSF for the pseudo inverse.
-            psf_left = self.camera_left.psf_at_camera(size=(100, 100), is_training=torch.tensor(False), modulate_phase=self.hparams.optimize_optics).unsqueeze(0)
+            psf_left = self.camera_left.psf_at_camera(size=(100, 100), is_training=False, modulate_phase=self.hparams.optimize_optics).unsqueeze(0)
             captimgs_right, target_volumes_right, _ = self.camera_right.forward_train(right_images_linear, self.flip(depthmaps_norm_m), 
                           occlusion=self.hparams.occlusion)
             # We don't want to use the jittered PSF for the pseudo inverse.
-            psf_right = self.camera_right.psf_at_camera(size=(100, 100), is_training=torch.tensor(False),modulate_phase=self.hparams.optimize_optics).unsqueeze(0)
+            psf_right = self.camera_right.psf_at_camera(size=(100, 100), is_training=False, modulate_phase=self.hparams.optimize_optics).unsqueeze(0)
         
         else:
             captimgs_left, target_volumes_left, psf_left =self.camera_left.forward(left_images_linear,depthmaps_norm,occlusion=self.hparams.occlusion, modulate_phase=self.hparams.optimize_optics)
@@ -300,7 +327,7 @@ class Stereo3D(pl.LightningModule):
         noise_sigma_right =(noise_sigma_max - noise_sigma_min)* torch.rand((captimgs_right.shape[0], 1, 1, 1),device=device_right,
                                                                            dtype=dtype_right) + noise_sigma_min
         # without Bayer
-        if not torch.tensor(self.hparams.bayer):
+        if not self.hparams.bayer:
             captimgs_left = captimgs_left + noise_sigma_left * torch.randn(captimgs_left.shape, device=device_left, dtype=dtype_left)
             captimgs_right = captimgs_right + noise_sigma_right * torch.randn(captimgs_right.shape, device=device_right, dtype=dtype_right)
         else:
@@ -342,16 +369,20 @@ class Stereo3D(pl.LightningModule):
         est=est_sq[-1]
         est_m=est_m_sq[-1]
         batch = captimgs_left.shape[0]
-        norm_max=torch.zeros(batch).cuda()
-        norm_min=torch.zeros(batch).cuda()
-        norm_max_m=torch.zeros(batch).cuda()
-        norm_min_m=torch.zeros(batch).cuda()
+        device = est.device  # Get device from model output
+        
+        # Compute normalization values on the same device as est
+        norm_max = torch.zeros(batch, device=device)
+        norm_min = torch.zeros(batch, device=device)
+        norm_max_m = torch.zeros(batch, device=device)
+        norm_min_m = torch.zeros(batch, device=device)
 
         dataNew = 'DOE_left.mat'
 
         for i in range(batch):
-            norm_max[i], norm_min[i]=depthmaps[i,...].max(),depthmaps[i,...].min()
-            norm_max_m[i], norm_min_m[i] = depthmaps_m[i,...].max(), depthmaps_m[i,...].min()
+            # Ensure depthmaps are on the same device before computing max/min
+            norm_max[i], norm_min[i] = depthmaps[i,...].to(device).max(), depthmaps[i,...].to(device).min()
+            norm_max_m[i], norm_min_m[i] = depthmaps_m[i,...].to(device).max(), depthmaps_m[i,...].to(device).min()
 
         input_rough=(est/255-norm_min.reshape(-1,1,1,1))/(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))
         input_rough_m=(est_m/255-norm_min_m.reshape(-1,1,1,1))/(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))
@@ -361,31 +392,66 @@ class Stereo3D(pl.LightningModule):
             b, c, h, w = est.shape
             w_disparity=F.interpolate(est, size=(int(h/hparams.scale), int(w/hparams.scale)), mode='bilinear', align_corners=False)
             w_disparity_2=F.interpolate(self.flip(est_m), size=(int(h/hparams.scale), int(w/hparams.scale)), mode='bilinear', align_corners=False)
+            
+            # Left reconstruction: warp right image to left view
             warped_right, mask=self.warping.warp_disp(captimgs_right, w_disparity, w_disparity_2)
             warped_right+=captimgs_left*(1-mask)
+            
+            # Right reconstruction: warp left image to right view (symmetric)
+            warped_left, mask_r=self.warping.warp_disp(captimgs_left, -w_disparity, -w_disparity_2)
+            warped_left+=captimgs_right*(1-mask_r)
+            
+            # Mirror left reconstruction
             warped_right_m, mask_m=self.warping.warp_disp(captimgs_right_m, self.flip(w_disparity_2), self.flip(w_disparity))
             warped_right_m+=captimgs_left_m*(1-mask_m)
+            
+            # Mirror right reconstruction (symmetric)
+            warped_left_m, mask_r_m=self.warping.warp_disp(captimgs_left_m, -self.flip(w_disparity_2), -self.flip(w_disparity))
+            warped_left_m+=captimgs_right_m*(1-mask_r_m)
+            
             right=warped_right
+            left_for_right=warped_left
             right_m=warped_right_m
+            left_for_right_m=warped_left_m
         
         else:
             right=captimgs_right
+            left_for_right=captimgs_left
             right_m=captimgs_right_m
+            left_for_right_m=captimgs_left_m
             
+        # Left image reconstruction
         Outputs = self.decoder(captimgs_left=captimgs_left.float(),
                                         pinv_volumes_left=pinv_volumes_left.float(),
                                         captimgs_right=right.float(),
                                         rough_depth=input_rough.float(), hparams=hparams)
+        
+        # Right image reconstruction: use right camera as primary view with warped left
+        Outputs_right = self.decoder(captimgs_left=captimgs_right.float(),
+                                        pinv_volumes_left=pinv_volumes_right.float(),
+                                        captimgs_right=left_for_right.float(),
+                                        rough_depth=self.flip(input_rough_m).float(), hparams=hparams)
                     
+        # Mirror left reconstruction
         Outputs_m = self.decoder(captimgs_left=captimgs_left_m.float(),
                                         pinv_volumes_left=pinv_volumes_left_m.float(),
                                         captimgs_right=right_m.float(),
                                         rough_depth=input_rough_m.float(), hparams=hparams)
+        
+        # Mirror right reconstruction with warped left
+        Outputs_right_m = self.decoder(captimgs_left=captimgs_right_m.float(),
+                                        pinv_volumes_left=pinv_volumes_right_m.float(),
+                                        captimgs_right=left_for_right_m.float(),
+                                        rough_depth=self.flip(input_rough).float(), hparams=hparams)
+        
         left=Outputs[0]
         est_dfd=Outputs[1]
         est_depthmaps = Outputs[2]
         est_dfd=est_dfd*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
         est_depthmaps=est_depthmaps*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
+
+        # 右图重建结果
+        right_recon = Outputs_right[0]
 
         left_m= Outputs_m[0]
         est_dfd_m=Outputs_m[1]
@@ -393,14 +459,15 @@ class Stereo3D(pl.LightningModule):
         est_dfd_m=est_dfd_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
         est_depthmaps_m=est_depthmaps_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
 
+        # 镜像右图重建结果
+        right_recon_m = Outputs_right_m[0]
+
         # Require twice cropping because the image formation also crops the boundary.
 
-        target_roughdepth = crop_boundary(depthmaps*255, 2 * self.crop_width)
-        target_roughdepth_m = crop_boundary(depthmaps_m*255, 2 * self.crop_width)
-        original_depthmaps = crop_boundary(original_depth, 2 * self.crop_width)
-        original_depthmaps_m = crop_boundary(original_depth_m, 2 * self.crop_width)
         est_images_left = crop_boundary(left, self.crop_width)
+        est_images_right = crop_boundary(right_recon, self.crop_width)
         est_images_left_m = crop_boundary(left_m, self.crop_width)
+        est_images_right_m = crop_boundary(right_recon_m, self.crop_width)
         outputs = StereoOutputs(
             target_images_right=original_right,
             target_images_left=original_left,
@@ -415,6 +482,7 @@ class Stereo3D(pl.LightningModule):
             captimgs_linear_right=captimgs_right,
             captimgs_linear_left=captimgs_left,
             est_images_left=est_images_left,
+            est_images_right=est_images_right,
             est_1=est_1,  #rough depth from matching
             est=est,
             est_sq=est_sq,
@@ -430,6 +498,7 @@ class Stereo3D(pl.LightningModule):
             captimgs_linear_right_m=captimgs_right_m,
             captimgs_linear_left_m=captimgs_left_m,
             est_images_left_m=est_images_left_m,
+            est_images_right_m=est_images_right_m,
             est_1_m=est_1_m,  #rough depth from matching
             est_m=est_m,
             est_dfd_m=est_dfd_m,
@@ -443,6 +512,10 @@ class Stereo3D(pl.LightningModule):
         self.crop_width = hparams.crop_width
         mask_diameter = hparams.mask_diameter #hparams.focal_length / hparams.f_number
         wavelengths = [632e-9, 550e-9, 450e-9]
+        
+        # Get use_pretrained_doe from hparams, default to False if not set
+        use_pretrained_doe = getattr(hparams, 'use_pretrained_doe', False)
+        
         camera_recipe = {
             'wavelengths': wavelengths,
             'min_depth': hparams.min_depth,
@@ -458,6 +531,7 @@ class Stereo3D(pl.LightningModule):
             'mask_upsample_factor': hparams.mask_upsample_factor,
             'diffraction_efficiency': hparams.diffraction_efficiency,
             'full_size': hparams.full_size,
+            'use_pretrained_doe': use_pretrained_doe,
         }
         camera_recipe_right = {
             'wavelengths': wavelengths,
@@ -474,6 +548,7 @@ class Stereo3D(pl.LightningModule):
             'mask_upsample_factor': hparams.mask_upsample_factor,
             'diffraction_efficiency': hparams.diffraction_efficiency,
             'full_size': hparams.full_size,
+            'use_pretrained_doe': use_pretrained_doe,
         }
         optimize_optics = hparams.optimize_optics
         doe_type=hparams.doe_type
@@ -494,34 +569,14 @@ class Stereo3D(pl.LightningModule):
             from optics import camera_right_pw as camera_right'''
         self.camera_left = camera_left.MixedCamera(**camera_recipe, requires_grad=optimize_optics)
         self.camera_right = camera_right.MixedCamera(**camera_recipe_right, requires_grad=optimize_optics)
-        self.matching = IGEVStereo(hparams) #CVNet(hparams, requires_grad=True)
+        self.matching = IGEVStereo(hparams)
         self.decoder = Recovery(hparams, requires_grad=True)
         self.debayer = Debayer3x3()
         self.image_lossfn = Vgg16PerceptualLoss()
-        self.image_lossfn2 = torch.nn.L1Loss()  #torch.nn.MSELoss()
+        self.image_lossfn2 = torch.nn.L1Loss()
         self.depth_lossfn = torch.nn.MSELoss()
-        self.depth_lossfn2= torch.nn.L1Loss()#torch.nn.SmoothL1Loss() #torch.nn.MSELoss() #torch.nn.L1Loss() 
+        self.depth_lossfn2 = torch.nn.L1Loss()
         print(self.camera_left)
-        
-        '''decoder_ckpt = '/mnt/ssd2/liuyuhui/checkpoint/version_108/checkpoints/interrupted_model.ckpt'
-        decoder_ckpt = torch.load(decoder_ckpt, map_location=lambda storage, loc: storage)
-        decoder_state_dict = {
-        key.replace('decoder.', '', 1): value 
-        for key, value in decoder_ckpt['state_dict'].items() 
-        if key.startswith('decoder.')}
-        self.decoder.load_state_dict(decoder_state_dict)'''
-
-        self.matching = torch.nn.DataParallel(self.matching, device_ids=[0])
-        self.matching.load_state_dict(torch.load('/mnt/ssd2/liuyuhui/checkpoint/sceneflow.pth'))
-        self.matching = self.matching.module
-        
-        for param in self.matching.parameters():
-            param.requires_grad = False
-        for param in self.camera_left.parameters():
-            param.requires_grad = False
-        for param in self.camera_right.parameters():
-            param.requires_grad = False
-        
 
     def __combine_loss(self, depth_loss,depth_1_loss, image_loss, psf_loss):
         return self.hparams.depth_loss_weight * depth_loss + \
@@ -533,9 +588,12 @@ class Stereo3D(pl.LightningModule):
         hparams = self.hparams
         target_depthmaps=outputs.target_depthmaps
         target_images_left=outputs.target_images_left
+        target_images_right=outputs.target_images_right  # 添加右图目标
         target_depthmaps_m=outputs.target_depthmaps_m
         target_images_left_m=outputs.target_images_left_m
+        target_images_right_m=outputs.target_images_right_m  # 添加镜像右图目标
         est_images_left = outputs.est_images_left
+        est_images_right = outputs.est_images_right  # 添加右图重建
         est_1=outputs.est_1
         est=outputs.est
         est_depthmaps = outputs.est_depthmaps
@@ -543,6 +601,7 @@ class Stereo3D(pl.LightningModule):
         target_roughdepth= outputs.target_roughdepth
         # Mirror
         est_images_left_m = outputs.est_images_left_m
+        est_images_right_m = outputs.est_images_right_m  # 添加镜像右图重建
         est_1_m=outputs.est_1_m
         est_m=outputs.est_m
         est_depthmaps_m = outputs.est_depthmaps_m
@@ -551,13 +610,15 @@ class Stereo3D(pl.LightningModule):
 
         psnr_left = calculate_psnr(est_images_left, target_images_left)
         ssmi_left = calculate_ssim(est_images_left, target_images_left)
-        norm_max, norm_min = outputs.norm_max.reshape(-1,1,1,1), outputs.norm_min.reshape(-1,1,1,1)
-        norm_max_m, norm_min_m = outputs.norm_max_m.reshape(-1,1,1,1), outputs.norm_min_m.reshape(-1,1,1,1)
-        left_image_loss = self.image_lossfn.train_loss(est_images_left, target_images_left)#+self.image_lossfn2(est_images_left, target_images_left)
-        left_image_loss_m = self.image_lossfn.train_loss(est_images_left_m, target_images_left_m)#+self.image_lossfn2(est_images_left_m, target_images_left_m)
-        #left_image_loss = self.image_lossfn(est_images_left, target_images_left)
         
-        #mag = torch.sum(target_roughdepth**2, dim=1).sqrt().unsqueeze(1)
+        # 左图重建损失
+        left_image_loss = self.image_lossfn.train_loss(est_images_left, target_images_left)
+        left_image_loss_m = self.image_lossfn.train_loss(est_images_left_m, target_images_left_m)
+        
+        # 添加右图重建损失 - 直接监督右相机
+        right_image_loss = self.image_lossfn.train_loss(est_images_right, target_images_right)
+        right_image_loss_m = self.image_lossfn.train_loss(est_images_right_m, target_images_right_m)
+        
         valid = ((target_roughdepth >= 0.5) & (target_roughdepth < hparams.max_disp))
         valid_m = ((target_roughdepth_m >= 0.5) & (target_roughdepth_m < hparams.max_disp))
         disp_loss = 0.0
@@ -575,40 +636,44 @@ class Stereo3D(pl.LightningModule):
 
         disp_loss/=hparams.train_iters
         disp_loss_m/=hparams.train_iters
-        est_norm=est/255
-        target_norm=target_roughdepth/255
-        depth_1_loss=disp_loss+mae(est_1[valid.bool()], target_roughdepth[valid.bool()])#+self.depth_lossfn2(est_1, target_roughdepth)
-        depth_2_loss=mae(est[valid.bool()], target_roughdepth[valid.bool()])#+self.depth_lossfn2(est, target_roughdepth)
+        depth_1_loss=disp_loss+mae(est_1[valid.bool()], target_roughdepth[valid.bool()])
+        depth_2_loss=mae(est[valid.bool()], target_roughdepth[valid.bool()])
         depth_2_loss_all=mae(est, target_roughdepth)
-        #depth_2_loss=self.depth_lossfn2(est, target_roughdepth)
-        depth_1_loss_m=disp_loss_m+mae(est_1_m[valid_m.bool()], target_roughdepth_m[valid_m.bool()])#+self.depth_lossfn2(est_1_m, target_roughdepth_m)
-        #depth_2_loss_m=mae(est_m[valid_m.bool()], target_roughdepth_m[valid_m.bool()])#+self.depth_lossfn2(est_m, target_roughdepth_m)
-        depth_2_loss_m=mae(est_m, target_roughdepth_m)
-        dfd_loss=mae(est_dfd, target_depthmaps)#+ self.depth_lossfn(est_dfd, target_depthmaps)
-        dfd_loss_m=mae(est_dfd_m, target_depthmaps_m)#+ self.depth_lossfn(est_dfd_m, target_depthmaps_m)
-        depth_loss = mae(est_depthmaps, target_depthmaps)#+ self.depth_lossfn(est_depthmaps, target_depthmaps) #0.5*self.depth_lossfn.train_loss(est_depthmaps, target_depthmaps)+self.depth_lossfn2(est_depthmaps, target_depthmaps)
+        depth_1_loss_m=disp_loss_m+mae(est_1_m[valid_m.bool()], target_roughdepth_m[valid_m.bool()])
+        depth_2_loss_m=mae(est_m[valid_m.bool()], target_roughdepth_m[valid_m.bool()])
+        dfd_loss=mae(est_dfd, target_depthmaps)
+        dfd_loss_m=mae(est_dfd_m, target_depthmaps_m)
+        depth_loss = mae(est_depthmaps, target_depthmaps)
         
         px_3=calculate_3px(255*est_depthmaps,255*target_depthmaps)
-        epe_loss = mae(255*est_depthmaps,255*target_depthmaps)#+ self.depth_lossfn(est_depthmaps, target_depthmaps) #0.5*self.depth_lossfn.train_loss(est_depthmaps, target_depthmaps)+self.depth_lossfn2(est_depthmaps, target_depthmaps)
+        epe_loss = mae(255*est_depthmaps,255*target_depthmaps)
         epe_loss_m = mae(255*est_depthmaps_m,255*target_depthmaps_m)
-        #print(epe_loss)
-        
-        depth_loss_m= mae(est_depthmaps_m, target_depthmaps_m)#+ self.depth_lossfn(est_depthmaps_m, target_depthmaps_m) #0.5*self.depth_lossfn.train_loss(est_depthmaps_m, target_depthmaps_m)+self.depth_lossfn2(est_depthmaps_m, target_depthmaps_m)
         psf_left_out_of_fov_sum = self.camera_left.psf_out_of_fov_energy(hparams.psf_size)
         psf_left_loss = psf_left_out_of_fov_sum
 
         psf_right_out_of_fov_sum = self.camera_right.psf_out_of_fov_energy(hparams.psf_size)
         psf_right_loss = psf_right_out_of_fov_sum
-        total_loss = self.__combine_loss((epe_loss+epe_loss_m+dfd_loss+dfd_loss_m)/2, (depth_2_loss+depth_2_loss_m)/2+(depth_1_loss+depth_1_loss_m)/4, left_image_loss+left_image_loss_m, psf_left_loss+psf_right_loss)
+        
+        # 合并图像损失：左图 + 右图（对称监督）
+        total_image_loss = (left_image_loss + left_image_loss_m + right_image_loss + right_image_loss_m) / 2
+        
+        total_loss = self.__combine_loss(
+            (epe_loss + epe_loss_m + dfd_loss + dfd_loss_m) / 10, 
+            (depth_2_loss + depth_2_loss_m) / 2 + (depth_1_loss + depth_1_loss_m) / 4, 
+            total_image_loss,  # 使用合并后的图像损失
+            psf_left_loss + psf_right_loss
+        )
+        
         logs = {
-            'total_loss': total_loss,#'delta': delta,
-            'depth_loss': depth_loss,#'dfd_loss': dfd_loss,
+            'total_loss': total_loss,
+            'depth_loss': depth_loss,
             'disp_loss': depth_2_loss, 
             'disp_loss_all': depth_2_loss_all, 
-            'left image_loss': left_image_loss,
-            'psf_loss_left':psf_left_loss,
-            'psf_loss_right':psf_right_loss,
-            'left_image_psnr': psnr_left, #'left_image_psnr_mirror': psnr_left_m,
+            'left_image_loss': left_image_loss,
+            'right_image_loss': right_image_loss,  # 添加右图损失日志
+            'psf_loss_left': psf_left_loss,
+            'psf_loss_right': psf_right_loss,
+            'left_image_psnr': psnr_left,
             'left_image_ssmi': ssmi_left,
             'depth_epe': epe_loss,
             'depth_3px': px_3,
@@ -620,13 +685,11 @@ class Stereo3D(pl.LightningModule):
         # Unpack outputs
         captimgs_left = outputs.captimgs_left
         est_images_left = outputs.est_images_left
-        #captimgs_right = outputs.captimgs_right
         est_depthmaps = outputs.est_depthmaps
         
-        est = outputs.est/255#-outputs.est.min())/(outputs.est.max()-outputs.est.min())
+        est = outputs.est/255
         target_roughdepth= outputs.target_roughdepth/255
-        target_depthmaps=outputs.target_depthmaps#*(outputs.norm_max.reshape(-1,1,1,1)-outputs.norm_min.reshape(-1,1,1,1))+outputs.norm_min.reshape(-1,1,1,1)
-
+        target_depthmaps=outputs.target_depthmaps
         captimgs_left_m = outputs.captimgs_left_m
         est_images_left_m = outputs.est_images_left_m
         est_depthmaps_m = outputs.est_depthmaps_m
@@ -655,22 +718,8 @@ class Stereo3D(pl.LightningModule):
         est_depthmaps_m= gray_to_rgb(1-est_depthmaps_m)
         target_depthmaps_m= gray_to_rgb(1-target_depthmaps_m)
 
-        #torchvision.utils.save_image(outputs.target_roughdepth[[0],...]/255,'dis.jpg')
-        #torchvision.utils.save_image(outputs.target_roughdepth_m[[0],...]/255,'dis2.jpg')
-        #torchvision.utils.save_image(target_images_left[[0],...],'cap.jpg')
-        #torchvision.utils.save_image(outputs.target_depthmaps[[0],...],'dep.jpg')
-
-        #pinv_volumes_left=outputs.pinv_volumes_left
-        #pinv_volumes_left=(pinv_volumes_left-pinv_volumes_left.min())/(pinv_volumes_left.max()-pinv_volumes_left.min())
         summary = torch.cat([captimgs_left[:,:3,...], captimgs_left_m[:,:3,...]], dim=-2)
-        #est=(est-est.min())/(est.max()-est.min())
-        #target_depthmaps=(target_depthmaps-target_depthmaps.min())/(target_depthmaps.max()-target_depthmaps.min())
-        #est_depthmaps=(est_depthmaps-est_depthmaps.min())/(est_depthmaps.max()-est_depthmaps.min())
-
-        '''psnr=calculate_psnr(target_images_left, est_images_left)
-        rmsed=rmse(target_depthmaps,est)
-        msed=mse(target_depthmaps,est)
-        print(psnr,msed,rmsed)'''
+        
         summary2 = torch.cat([target_images_left, est_images_left, target_depthmaps,est, est_dfd, est_depthmaps], dim=-2)
         summary3 = torch.cat([target_images_left_m, est_images_left_m, target_depthmaps_m, est_m, est_dfd_m, est_depthmaps_m], dim=-2)
         summary = summary[:summary_max_images]
@@ -685,45 +734,17 @@ class Stereo3D(pl.LightningModule):
         
         if self.hparams.optimize_optics or self.global_step >=0:
 
-            size=(50,50)
-            #size=(256,256)#self.hparams.image_sz
-            # PSF and heightmap is not visualized at computed size.
-            psf_left = self.camera_left.psf_at_camera(size=size, is_training=torch.tensor(False), modulate_phase=self.hparams.optimize_optics)
-            #psf_left = self.camera_left.normalize_psf(psf_left)
-            #psf_left=crop_psf(psf_left, 100)
-            #psf_left = fftshift(psf_left, dims=(-1, -2))
-            #psf_left /= psf_left.max()
-            
+            size=(200,200)
+            psf_left = self.camera_left.psf_at_camera(size=size, is_training=False, modulate_phase=self.hparams.optimize_optics)
 
-            '''c,d,h,w=psf_left.shape
-            kernel=torch.tensor(cv2.getGaussianKernel(3, 1)).cuda()
-            kernel_2d=(kernel*kernel.T)#.reshape(1,1,3,3)
-            #psf=psf.view(b*c,d,h,w)
-            for i in range(c):
-                for j in range(d):
-                    psf_left[[i],[j],...]=F.conv2d(psf_left[[i],[j],...], kernel_2d.expand(1,1,3,3), padding=(1,1))
-                #psf_left[i,...]=F.conv2d(psf_left[i,...], kernel_2d.expand(5,5,3,3), padding=(1,1))
-            #psf=psf.view(b,c,d,h,w)
-            '''
-            #phasemap_left_1 = imresize(self.camera_left.height()[None, None, ...],
-                                 #[self.hparams.summary_mask_sz, self.hparams.summary_mask_sz]).squeeze(0)
-            
             phasemap_left_1 = imresize(self.camera_left.phase()[[1], :, :,:],
                                  [self.hparams.summary_mask_sz, self.hparams.summary_mask_sz]).squeeze(0)
             
-            #sorted, _ = torch.sort(heightmap_left.view(-1))
-            #heightmap_left = torch.where(heightmap_left == heightmap_left.min(), sorted[-2], heightmap_left)
-            #heightmap_left -= heightmap_left.min()
-            #heightmap_left /= heightmap_left.max()
-
             sorted_0, _ = torch.sort(phasemap_left_1.view(-1))
             phasemap_left_1 = torch.where(phasemap_left_1 == phasemap_left_1.min(), sorted_0[-2], phasemap_left_1)
             phasemap_left_1 -= phasemap_left_1.min()
             phasemap_left_1 /= phasemap_left_1.max()
-
             
-
-            #self.logger.experiment.add_image('optics/heightmap_left', heightmap_left, self.global_step)
             self.logger.experiment.add_image('optics/phasemap_left_G', phasemap_left_1, self.global_step)
             psf_left= psf_left.flip(1)
             grid_psf_left = torchvision.utils.make_grid(psf_left.transpose(0, 1),
@@ -736,47 +757,13 @@ class Stereo3D(pl.LightningModule):
                                                    nrow=9, pad_value=1, normalize=False)
             self.logger.experiment.add_image('optics/psf_stretched_left', grid_psf_left, self.global_step)
 
-           
-
-            #psf_right=outputs.psf_right[[0],:,:,:,:].squeeze(0)
-            psf_right = self.camera_right.psf_at_camera(size=size , is_training=torch.tensor(False),modulate_phase=self.hparams.optimize_optics)
-            #psf_right = self.camera_right.normalize_psf(psf_right)
-            #psf_right=crop_psf(psf_right, 100)
-            #psf_right = fftshift(psf_right, dims=(-1, -2))
-            #psf_right /= psf_right.max()
-
-            #phasemap_right_1 = imresize(self.camera_right.height()[None, None, ...],
-                                 #[self.hparams.summary_mask_sz, self.hparams.summary_mask_sz]).squeeze(0)
-            
+            psf_right = self.camera_right.psf_at_camera(size=size, is_training=False, modulate_phase=self.hparams.optimize_optics)
             phasemap_right_1 = imresize(self.camera_right.phase()[[1], :, :,:],
                                  [self.hparams.summary_mask_sz, self.hparams.summary_mask_sz]).squeeze(0)
-            
-            #sorted_r, _ = torch.sort(heightmap_right.view(-1))
-            #eightmap_right = torch.where(heightmap_right == heightmap_right.min(), sorted_r[-2], heightmap_right)
-            #heightmap_right -= heightmap_right.min()
-            #heightmap_right /= heightmap_right.max()
-
             sorted_0_r, _ = torch.sort(phasemap_right_1.view(-1))
             phasemap_right_1 = torch.where(phasemap_right_1 == phasemap_right_1.min(), sorted_0_r[-2], phasemap_right_1)
             phasemap_right_1 -= phasemap_right_1.min()
             phasemap_right_1 /= phasemap_right_1.max()
-            '''save_left=F.interpolate(phasemap_left_1.unsqueeze(0), size=(630, 630), mode='bilinear', align_corners=True).squeeze(0).squeeze(0)
-            save_right=F.interpolate(phasemap_right_1.unsqueeze(0), size=(630, 630), mode='bilinear', align_corners=True).squeeze(0).squeeze(0)
-            torchvision.utils.save_image(save_left,'doe_left.png')
-            torchvision.utils.save_image(save_right,'doe_right.png')
-            import scipy.io as scio
-            dataNew1 = 'doe_left.mat'
-            save_left= save_left*2 * torch.pi
-            save_left= save_left.cpu().numpy()
-            scio.savemat(dataNew1,{'phase':save_left,'scale':7,'wavelength': '550nm, N=4', 'aperture_type': 'rectangular'})
-            save_right= save_right*2 * torch.pi
-            save_right= save_right.cpu().numpy()
-            print(save_right.shape, save_right)
-            dataNew2 = 'doe_right.mat'
-            scio.savemat(dataNew2,{'phase':save_right,'scale':7,'wavelength': '550nm, N=4', 'aperture_type': 'rectangular'})
-
-            print(scio.loadmat('doe_left.mat'))'''
-            #self.logger.experiment.add_image('optics/heightmap_right', heightmap_right, self.global_step)
             self.logger.experiment.add_image('optics/phasemap_right_G', phasemap_right_1, self.global_step)
             psf_right= psf_right.flip(1)
             grid_psf_right = torchvision.utils.make_grid(psf_right.transpose(0, 1),
@@ -791,10 +778,24 @@ class Stereo3D(pl.LightningModule):
     @staticmethod
     def add_model_specific_args(parent_parser):
         """
-        Specify the hyperparams for this LightningModule
+        Add model-specific arguments to the argument parser.
+        
+        Supports both config file and command-line arguments. When both are provided,
+        command-line arguments take precedence over config file values.
+        
+        Args:
+            parent_parser: Parent ArgumentParser to extend
+            
+        Returns:
+            ArgumentParser with all model-specific arguments added
         """
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
-        # logger parameters
+        
+        # Config file argument (highest priority when loading defaults)
+        parser.add_argument('--config', type=str, default=None, 
+                           help='Path to YAML configuration file (e.g., configs/default.yaml)')
+        
+        # Logger parameters
         parser.add_argument('--summary_max_images', type=int, default=8)
         parser.add_argument('--summary_image_sz', type=int, default=200)#256)
         parser.add_argument('--summary_mask_sz', type=int, default=1260)#256)
@@ -805,22 +806,21 @@ class Stereo3D(pl.LightningModule):
         parser.add_argument('--cnn_lr', type=float, default=1e-3)#0.5e-3)
         parser.add_argument('--depth_lr', type=float, default=1e-5)
         parser.add_argument('--optics_lr', type=float, default=0)#0.1e-3)#2e-2)#1e-3)#=0.5e-3
-        parser.add_argument('--batch_sz', type=int, default=4)#10) #6
-        #parser.add_argument('--control_num', type=int, default=5)z
+        parser.add_argument('--batch_sz', type=int, default=1)#10) #6
         parser.add_argument('--num_workers', type=int, default=8)
         parser.add_argument('--augment', default=True, action='store_true')
         
         # loss parameters
         parser.add_argument('--depth_loss_weight', type=float, default=1)
-        parser.add_argument('--depth_1_loss_weight', type=float, default=1)#0.5)
-        parser.add_argument('--image_loss_weight', type=float, default=10)
+        parser.add_argument('--depth_1_loss_weight', type=float, default=0)#0.5)
+        parser.add_argument('--image_loss_weight', type=float, default=1)
         parser.add_argument('--psf_loss_weight', type=float, default=0)
         parser.add_argument('--psf_size', type=int, default=160)
 
         # dataset parameters
-        parser.add_argument('--image_sz', type=list, default= [320, 736])#[128,384])##[128,256]) #[160,160])[160,448]
+        parser.add_argument('--image_sz', type=list, default=[320, 736])
         parser.add_argument('--n_depths', type=int, default=7)
-        parser.add_argument('--min_depth', type=float, default=0.67) #0.67)
+        parser.add_argument('--min_depth', type=float, default=0.67) 
         parser.add_argument('--max_depth', type=float, default=8.0)
         parser.add_argument('--crop_width', type=int, default=0)
 
@@ -834,20 +834,20 @@ class Stereo3D(pl.LightningModule):
         parser.set_defaults(warp_img=True)
         # optics parameters
         parser.add_argument('--camera_type', type=str, default='mixed')
-        parser.add_argument('--mask_sz', type=int, default=1260) #1260) 
+        parser.add_argument('--mask_sz', type=int, default=1260) 
         
         parser.add_argument('--focal_length', type=float, default=35e-3)
-        parser.add_argument('--focal_depth', type=float, default=1.23) #1.78) #1.7) 1.23
-        parser.add_argument('--focal_depth_right', type=float, default=1.23) # 3.7) #1.7) 1.23
-        parser.add_argument('--mask_pitch', type=float, default=3.45e-6)#3.5e-6) #3.6e-6)#4.5)
-        parser.add_argument('--mask_diameter', type=float, default=4.347e-3)#4.41e-3) # 4.76e-3) #4.86e-3) #0.0036) 4.221
-        parser.add_argument('--camera_pixel_pitch', type=float, default=5.86e-6)#5.86e-6) #6.45e-6)
+        parser.add_argument('--focal_depth', type=float, default=1.23) 
+        parser.add_argument('--focal_depth_right', type=float, default=1.23) 
+        parser.add_argument('--mask_pitch', type=float, default=3.45e-6)
+        parser.add_argument('--mask_diameter', type=float, default=4.347e-3)
+        parser.add_argument('--camera_pixel_pitch', type=float, default=5.86e-6)
         parser.add_argument('--noise_sigma_min', type=float, default=0.001)
         parser.add_argument('--noise_sigma_max', type=float, default=0.005)
         parser.add_argument('--full_size', type=int, default=1200)
         parser.add_argument('--mask_upsample_factor', type=int, default=2)
         parser.add_argument('--diffraction_efficiency', type=float, default=0.7)
-        parser.add_argument('--scale', type=float, default=1)#1.5)
+        parser.add_argument('--scale', type=float, default=1)
 
         parser.add_argument('--bayer', dest='bayer', action='store_true')
         parser.add_argument('--no-bayer', dest='bayer', action='store_false')
@@ -857,7 +857,7 @@ class Stereo3D(pl.LightningModule):
         parser.set_defaults(occlusion=True)
         parser.add_argument('--optimize_optics', dest='optimize_optics', action='store_true')
         parser.add_argument('--no-optimize_optics', dest='optimize_optics', action='store_false')
-        parser.set_defaults(optimize_optics=False)
+        parser.set_defaults(optimize_optics=True)
         parser.add_argument('--doe_type', type=str, default='rank2', help="doe modeling method")
         
         # model parameters
@@ -868,11 +868,11 @@ class Stereo3D(pl.LightningModule):
         ###IGEV
         parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
         parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
-        parser.add_argument('--train_iters', type=int, default=22, help="number of updates to the disparity field in each forward pass.")
+        parser.add_argument('--train_iters', type=int, default=12, help="number of updates to the disparity field in each forward pass.")
         parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
 
         # Validation parameters
-        parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during validation forward pass')
+        parser.add_argument('--valid_iters', type=int, default=16, help='number of flow-field updates during validation forward pass')
 
         # Architecure choices
         parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
@@ -894,3 +894,72 @@ class Stereo3D(pl.LightningModule):
         torch.manual_seed(666)
 
         return parser
+
+    @staticmethod
+    def load_args_from_config(args):
+        """
+        Load configuration from YAML file and merge with command-line arguments.
+        
+        Priority order (highest to lowest):
+        1. Command-line arguments (explicitly provided)
+        2. Config file values
+        3. Default values in argparse
+        
+        Args:
+            args: Namespace object from argparse
+            
+        Returns:
+            Updated Namespace with merged configuration
+        """
+        if not CONFIG_AVAILABLE:
+            print("Warning: config module not available. Using command-line args only.")
+            return args
+            
+        if args.config is None:
+            return args
+        
+        # Load config from YAML file
+        try:
+            config = load_config(args.config)
+            config_hparams = config.to_hparams()
+            print(f"Loaded configuration from: {args.config}")
+        except FileNotFoundError:
+            print(f"Warning: Config file not found: {args.config}")
+            return args
+        except Exception as e:
+            print(f"Warning: Error loading config file: {e}")
+            return args
+        
+        # Merge config values with args (command-line args take priority)
+        for key, value in config_hparams.items():
+            # Only update if not explicitly set via command line
+            if hasattr(args, key):
+                current_value = getattr(args, key)
+                # Check if value is still the default (argparse default)
+                # This is a simple heuristic - explicit CLI args will override
+                setattr(args, key, value)
+        
+        return args
+
+
+def load_hparams_from_config(config_path: str) -> Namespace:
+    """
+    Convenience function to load hyperparameters directly from a config file.
+    
+    This allows using config files without argparse for inference or testing.
+    
+    Args:
+        config_path: Path to YAML configuration file
+        
+    Returns:
+        Namespace object with all hyperparameters
+        
+    Example:
+        hparams = load_hparams_from_config('configs/rank2.yaml')
+        model = Stereo3D(hparams)
+    """
+    if not CONFIG_AVAILABLE:
+        raise ImportError("config module not available. Please check config.py exists.")
+    
+    config = load_config(config_path)
+    return config_to_namespace(config)

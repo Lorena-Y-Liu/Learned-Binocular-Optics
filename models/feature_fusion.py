@@ -37,8 +37,7 @@ class LayerNorm2d(nn.Module):
 
 class SCAM(nn.Module):
     '''
-    Stereo Cross Attention Module (SCAM) —— 改进版
-    除了原有的交叉注意力分支外，增加了高频信息提取模块以强化细节。
+    Stereo Cross Attention Module (SCAM) 
     '''
     def __init__(self, c):
         super().__init__()
@@ -57,12 +56,9 @@ class SCAM(nn.Module):
 
         self.l_proj3 = nn.Conv2d(c, c, kernel_size=1, stride=1, padding=0)
         self.r_proj3 = nn.Conv2d(c, c, kernel_size=1, stride=1, padding=0)
-
-        # 新增：高频信息提取卷积，将输入特征（高频部分）映射到相同维度
         self.hf_conv = nn.Conv2d(c, c, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x_l, x_r):
-        # 交叉注意力计算
         Q_l = self.l_proj1(self.norm_l(x_l)).permute(0, 2, 3, 1)  # (B, H, W, c)
         Q_r_T = self.r_proj1(self.norm_r(x_r)).permute(0, 2, 1, 3) # (B, H, c, W)
         V_r = self.r_proj3(x_r).permute(0, 2, 3, 1)                # (B, H, W, c)
@@ -71,13 +67,8 @@ class SCAM(nn.Module):
         attn_weights = torch.softmax(attention, dim=-1)
         F_r2l = torch.matmul(attn_weights, V_r)                    # (B, H, W, c)
         F_r2l = F_r2l.permute(0, 3, 1, 2) * self.beta
-
-        # 高频信息提取
-        # 通过平均池化得到低频部分，再做差得到高频成分
         x_r_blur = F.avg_pool2d(x_r, kernel_size=3, stride=1, padding=1)
         hf = x_r - x_r_blur
-        hf = self.hf_conv(hf)  # 映射到相同通道
-
-        # 融合原始 x_l、交叉注意力特征和高频信息（后者由参数 gamma 调控贡献）
+        hf = self.hf_conv(hf)  
         out = x_l + F_r2l + self.gamma * hf
         return out

@@ -1,0 +1,30 @@
+# Deep Stereo Dependencies
+
+# PyTorch (install according to your CUDA version)
+# See: https://pytorch.org/get-started/locally/
+torch>=1.9.0
+torchvision>=0.10.0
+
+# PyTorch Lightning for training
+pytorch-lightning>=1.5.0
+
+# Image processing
+opencv-python>=4.5.0
+Pillow>=8.0.0
+
+# Numerical computing
+numpy>=1.19.0
+scipy>=1.6.0
+
+# Metrics
+torchmetrics>=0.6.0
+
+# Visualization and logging
+tensorboard>=2.4.0
+imageio>=2.9.0
+
+# Debayer processing
+debayer
+
+# Other utilities
+tqdm>=4.60.0

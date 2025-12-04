@@ -1,473 +1,457 @@
-import abc
-import math
+"""
+Rank-2 DOE (Diffractive Optical Element) camera module for left camera.
+
+This module implements a camera with Rank-2 low-rank DOE parameterization,
+enabling efficient optimization of the phase mask with reduced parameters.
+The Rank-2 structure represents the height map as a sum of two outer products.
+"""
+
 from typing import List, Union
-from ls_asm.input_field import InputField
-from ls_asm.LSASM import LeastSamplingASM
+
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-#from ls_asm import PropagationModel
-from util import complex, cubicspline
-from util.fft import fftshift
-from util.helper import copy_quadruple, depthmap_to_layereddepth, ips_to_metric, over_op, \
-    refractive_index
-from psf.psf_import import *
-try:
-    from torch import irfft
-    from torch import rfft
-except ImportError:
-    from torch.fft import irfft
-    from torch.fft import rfft
-    def rfft(x, d):
-        t=torch.fft.fft2(x, dim = (-d,-1))
-        return torch.stack((t.real, t.imag), -1)
-    def irfft(x, d, signal_sizes):
-        t = torch.fft.ifft2(torch.complex(x[...,0], x[...,1]), dim = (-d,-1))
-        return t.real
-import cv2
-class BaseCamera(nn.Module, metaclass=abc.ABCMeta):
 
-
-    def __init__(self, focal_depth, min_depth, max_depth, n_depths, image_size, mask_size, mask_pitch,
-                 focal_length, mask_diameter, camera_pixel_pitch, wavelengths, full_size=1920, mask_upsample_factor=1,
-                 diffraction_efficiency=0.7, require_grads=False, **kwargs):
-        super().__init__()
-        assert min_depth > 1e-6, f'Minimum depth is too small. min_depth: {min_depth}'
-        scene_distances = ips_to_metric(torch.linspace(0, 1, steps=n_depths), min_depth, max_depth)
-        scene_distances = scene_distances.flip(-1)
-        
-        self.modulate_phase=require_grads
-        self._register_wavlength(wavelengths)
-        self.n_depths = n_depths
-        self.min_depth = min_depth
-        self.max_depth = max_depth
-
-        self.focal_depth = focal_depth
-        self.mask_diameter = mask_diameter
-        self.camera_pixel_pitch = camera_pixel_pitch
-        self.focal_length = focal_length
-        self.f_number = self.focal_length / self.mask_diameter
-        self.image_size = self._normalize_image_size(image_size)
-        self.mask_pitch = mask_pitch#self.mask_diameter / mask_size
-        self.mask_size = mask_size
-        self.full_size = full_size
-        self.device = 'cuda'
-        self.register_buffer('scene_distances', scene_distances)
-        self.experiment=False
-        
-
-    def _register_wavlength(self, wavelengths):
-        if isinstance(wavelengths, list):
-            wavelengths = torch.tensor(wavelengths)  # in [meter]
-        elif isinstance(wavelengths, float):
-            wavelengths = torch.tensor([wavelengths])
-        else:
-            raise ValueError('wavelengths has to be a float or a list of floats.')
-
-        if len(wavelengths) % 3 != 0:
-            raise ValueError('the number of wavelengths has to be a multiple of 3.')
-
-        self.n_wl = len(wavelengths)
-        if not hasattr(self, 'wavelengths'):
-            self.register_buffer('wavelengths', wavelengths)
-        else:
-            self.wavelengths = wavelengths.to(self.wavelengths.device)
-
-
-    def sensor_distance(self):
-        return 1. / (1. / self.focal_length - 1. / self.focal_depth)
-
-    def normalize_psf(self, psfimg):
-        # Scale the psf
-        # As the incoming light doesn't change, we compute the PSF energy without the phase modulation
-        # and use it to normalize PSF with phase modulation.
-        return psfimg / psfimg.sum(dim=(-2, -1), keepdims=True)
-
-    def _capture_impl(self, volume, layered_depth, psf, occlusion, eps=1e-3):
-        scale = volume.max()
-        volume = volume / scale
-        Fpsf = rfft(psf, 2)
-        if occlusion:
-            Fvolume = rfft(volume, 2)
-            Flayered_depth = rfft(layered_depth, 2)
-            blurred_alpha_rgb = irfft(
-                complex.multiply(Flayered_depth, Fpsf), 2, signal_sizes=volume.shape[-2:])
-
-            blurred_volume = irfft(
-                complex.multiply(Fvolume, Fpsf), 2, signal_sizes=volume.shape[-2:])
-         
-            # Normalize the blurred intensity
-            cumsum_alpha = torch.flip(torch.cumsum(torch.flip(layered_depth, dims=(-3,)), dim=-3), dims=(-3,))
-            Fcumsum_alpha = rfft(cumsum_alpha, 2)
-            blurred_cumsum_alpha = irfft(
-                complex.multiply(Fcumsum_alpha, Fpsf), 2, signal_sizes=volume.shape[-2:])
-            
-            blurred_volume = blurred_volume / (blurred_cumsum_alpha + eps)
-            blurred_alpha_rgb = blurred_alpha_rgb / (blurred_cumsum_alpha + eps)
-            over_alpha = over_op(blurred_alpha_rgb)
-
-
-            captimg = torch.sum(over_alpha * blurred_volume, dim=2)
-            
-        else:
-            Fvolume = rfft(volume, 2)
-            Fcaptimg = complex.multiply(Fvolume, Fpsf).sum(dim=2)
-            captimg = irfft(Fcaptimg, 2, signal_sizes=volume.shape[-2:0])
-        
-        #[1,3,5,160,160], [1,3,5,160,160,2]
-        #pp=psf[0,:,0,...]/psf[0,:,0,...].max()
-        #torchvision.utils.save_image(pp, 'psf.png')
-        #torchvision.utils.save_image(Fpsf[0,:,0,...,0], 'Fpsf.png')
-        #[1,3,5,160,160], [1,3,5,160,160,2]
-        #pp=psf[0,:,-2,...]/psf[0,:,-2,...].max()
-        #torchvision.utils.save_image(fftshift(pp,dims=(-1, -2)), 'psf_l.png')
-        #Fpp=fftshift(rfft(pp, 2),dims=(-2, -3))
-        #torchvision.utils.save_image(Fpp[...,0], 'Fpsf_l.png')
-        
-        
-        captimg = scale * captimg
-        volume = scale * volume
-        return captimg, volume
-
-    def _capture_from_rgbd_with_psf_impl(self, img, depthmap, psf, occlusion):
-       # psf = F.interpolate(psf, size=(self.n_depths, psf.shape[-2], psf.shape[-1]), mode='trilinear', align_corners=False)
-        layered_depth = depthmap_to_layereddepth(depthmap, self.n_depths, binary=True)
-        volume = layered_depth * img[:, :, None, ...]
-        return self._capture_impl(volume, layered_depth, psf, occlusion)
-
-    def capture_from_rgbd(self, img, depthmap, occlusion):
-        psf = self.psf_at_camera(img.shape[-2:], self.modulate_phase)  # add batch dimension
-        psf=fftshift(self.normalize_psf(psf),dims=(-1,-2))
-        return self.capture_from_rgbd_with_psf(img, depthmap, psf, occlusion)
-
-    def capture_from_rgbd_with_psf(self, img, depthmap, psf, occlusion):
-        return self._capture_from_rgbd_with_psf_impl(img, depthmap,psf, occlusion)[0]
-        
-
-    @abc.abstractmethod
-    def psf_at_camera(self, size, modulate_phase, is_training=torch.tensor(False)):
-        pass
-
-    @abc.abstractmethod
-    def height(self):
-        pass
-
-    def forward(self, img, depthmap, occlusion, modulate_phase, is_training=torch.tensor(False)):
-        """
-        Args:
-            img: B x C x H x W
-
-        Returns:
-            captured image: B x C x H x W
-        """
-        psf = self.psf_at_camera(img.shape[-2:], modulate_phase, is_training=is_training).unsqueeze(0)  # add batch dimension
-        
-        psf = fftshift(self.normalize_psf(psf),dims=(-1,-2))
-        #psf = F.interpolate(psf, size=(self.n_depths, psf.shape[-2], psf.shape[-1]), mode='trilinear', align_corners=False)
-        captimg, volume = self._capture_from_rgbd_with_psf_impl(img, depthmap, psf, occlusion)
-        return captimg, volume, psf
-
-    def _normalize_image_size(self, image_size):
-        if isinstance(image_size, int):
-            image_size = [image_size, image_size]
-        elif isinstance(image_size, list):
-            if image_size[0] % 2 == 1 or image_size[1] % 2 == 1:
-                raise ValueError('Image size has to be even.')
-        else:
-            raise ValueError('image_size has to be int or list of int.')
-        return image_size
-
-    def set_image_size(self, image_size):
-        image_size = self._normalize_image_size(image_size)
-        self.image_size = image_size
-
-    def set_wavelengths(self, wavelengths):
-        self._register_wavlength(wavelengths)
-
-    def set_n_depths(self, n_depths):
-        self.n_depths = n_depths
-
-    def Propagation(self, scene_distances, modulate_phase):
-        r = self.focal_length/self.f_number/2
-        self.k = 2 * torch.pi / self.wavelengths
-        self.modulate_phase = modulate_phase
-        self.s_LSASM = 1
-        self.thetaX = 0
-        self.thetaY = 0
-        wavelength=self.wavelengths.reshape(-1).double()
-        zf = 1 / (1 / self.focal_length - 1 / self.focal_depth)
-        Uin = InputField("12", wavelength, r,  scene_distances, self.focal_length, zf, self.mask_size, torch.tensor(False), None)
-        E0=Uin.E0
-        
-        return Uin, E0
-
-    
-    def extra_repr(self):
-        msg = f'Right Camera module...\n' \
-              f'Refcative index for center wavelength: {refractive_index(self.wavelengths[self.n_wl // 2])} \n' \
-              f'Mask pitch: {self.mask_pitch }[m] \n' \
-              f'f number: {self.f_number} \n' \
-              f'mask diameter: {self.mask_diameter}[m] \n' \
-              f'Depths: {self.scene_distances} \n' \
-              f'Input image size: {self.image_size} \n'
-        return msg
+from ls_asm.LSASM import LeastSamplingASM
+from optics.base_camera import BaseCamera
+from psf.psf_import import psf_captured
+from util.helper import copy_quadruple, ips_to_metric, refractive_index
 
 
 class MixedCamera(BaseCamera):
-    def __init__(self, focal_depth: float, min_depth: float, max_depth: float, n_depths: int,
-                 image_size: Union[int, List[int]], mask_size: int, mask_pitch: float, focal_length: float, mask_diameter: float,
-                 camera_pixel_pitch: float, wavelengths=torch.tensor([632e-9, 550e-9, 450e-9]), full_size=100, mask_upsample_factor=1,
-                 diffraction_efficiency=0.7,  requires_grad: bool = True):
+    """
+    Left camera with Rank-2 parameterized diffractive optical element.
+    
+    The DOE height map is parameterized as:
+        h(x,y) = y_0 * x_0^T + y_1 * x_1^T
+    
+    This low-rank representation reduces the number of parameters while
+    maintaining sufficient expressiveness for depth-from-defocus applications.
+    
+    Args:
+        focal_depth: Focal depth of the camera in meters
+        min_depth: Minimum scene depth in meters
+        max_depth: Maximum scene depth in meters
+        n_depths: Number of discrete depth planes
+        image_size: Output image size (int or [H, W])
+        mask_size: Size of the DOE mask in pixels
+        mask_pitch: Physical pitch of mask pixels in meters
+        focal_length: Camera focal length in meters
+        mask_diameter: Physical diameter of the DOE mask in meters
+        camera_pixel_pitch: Physical size of camera sensor pixels in meters
+        wavelengths: List of wavelengths to simulate in meters
+        full_size: Full PSF computation size
+        mask_upsample_factor: Upsampling factor for mask computation
+        diffraction_efficiency: Efficiency of the diffractive element (0-1)
+        requires_grad: Whether to enable gradient computation for DOE optimization
+    """
+    
+    # Maximum height of the DOE in meters
+    H_MAX = 0.55 / 0.5625 * 1e-6
+    
+    # PSF observation grid size
+    PSF_OBS_SIZE = 256
+    
+    # Camera sensor pixel pitch in meters
+    SENSOR_PIXEL_PITCH = 5.86e-6
+    
+    def __init__(
+        self,
+        focal_depth: float,
+        min_depth: float,
+        max_depth: float,
+        n_depths: int,
+        image_size: Union[int, List[int]],
+        mask_size: int,
+        mask_pitch: float,
+        focal_length: float,
+        mask_diameter: float,
+        camera_pixel_pitch: float,
+        wavelengths: torch.Tensor = torch.tensor([632e-9, 550e-9, 450e-9]),
+        full_size: int = 100,
+        mask_upsample_factor: int = 1,
+        diffraction_efficiency: float = 0.7,
+        requires_grad: bool = True,
+        use_pretrained_doe: bool = True
+    ):
         self.diffraction_efficiency = diffraction_efficiency
-        super().__init__(focal_depth, min_depth, max_depth, n_depths, image_size, mask_size, mask_pitch, focal_length,
-                         mask_diameter, camera_pixel_pitch, wavelengths, full_size, mask_upsample_factor,
-                         requires_grad)
+        super().__init__(
+            focal_depth, min_depth, max_depth, n_depths,
+            image_size, mask_size, mask_pitch, focal_length,
+            mask_diameter, camera_pixel_pitch, wavelengths,
+            full_size, mask_upsample_factor, requires_grad
+        )
+        
         self.full_size = full_size
-        # Rank 1 Initialization
-        n_param= mask_size//2 // mask_upsample_factor
-        y=torch.arange(0,n_param,1).cuda()
-        
-        n= torch.tensor(n_param).cuda()
-        init_heightmap1d_x_0 = 4*torch.ones(n_param).cuda().float()
-        init_heightmap1d_x_1 = 4*(1-(torch.square(y))/torch.square(n)).cuda().float()
-        init_heightmap1d_y_0 = 2*(1-(torch.square(y))/torch.square(n)).cuda().float()
-        init_heightmap1d_y_1 = 4*torch.ones(n_param).cuda().float()
-
-        
-
-        init_heightmap1d_x_0=torch.load('doe_vector/x_0_l.pth')
-        init_heightmap1d_y_0=torch.load('doe_vector/y_0_l.pth')
-        init_heightmap1d_x_1=torch.load('doe_vector/x_1_l.pth')
-        init_heightmap1d_y_1=torch.load('doe_vector/y_1_l.pth')
-        
-        
-
-        self.heightmap1d_x_0 = torch.nn.Parameter(init_heightmap1d_x_0, requires_grad=requires_grad)
-        self.heightmap1d_y_0= torch.nn.Parameter(init_heightmap1d_y_0, requires_grad=requires_grad)
-        self.heightmap1d_x_1 = torch.nn.Parameter(init_heightmap1d_x_1, requires_grad=requires_grad)
-        self.heightmap1d_y_1 = torch.nn.Parameter(init_heightmap1d_y_1, requires_grad=requires_grad)
-
-        self.h_max=0.55/0.5625*1e-6#1.1*1e-6 #0.55/0.5626*1e-6
-        
         self.mask_upsample_factor = mask_upsample_factor
         self.modulate_phase = requires_grad
-        self.Uin, self.E0=self.Propagation(self.scene_distances, self.modulate_phase)
-        self.wvls = self.wavelengths  # wavelength of light in vacuum
-        self.k = 2 * torch.pi / self.wavelengths 
-        self.s = 1.0 #1.5
-        self.zf = 1 / (1 / self.focal_length - 1 / self.focal_depth)#Uin.zf
-        self.D = self.focal_length/self.f_number
+        
+        # Initialize DOE parameters (load from pretrained vectors or use analytical init)
+        self._init_doe_parameters(requires_grad, use_pretrained_doe)
+        
+        # Initialize propagation model
+        self.Uin, self.E0 = self.propagation(self.scene_distances, self.modulate_phase)
+        
+        # Store propagation parameters
+        self.wvls = self.wavelengths
+        self.k = 2 * torch.pi / self.wavelengths
+        self.s = 1.0
+        self.zf = 1 / (1 / self.focal_length - 1 / self.focal_depth)
+        self.D = self.focal_length / self.f_number
         self.pupil = self.Uin.pupil
-
+        
+        # Store frequency coordinates from input field
         self.fcX, self.fcY = self.Uin.fcX, self.Uin.fcY
         self.fbX, self.fbY = self.Uin.fbX, self.Uin.fbY
         self.xi, self.eta = self.Uin.xi, self.Uin.eta
         self.xi_, self.eta_ = self.Uin.xi_, self.Uin.eta_
 
-    # Rank 1 Coding
-    def heightmap1d_x(self):
+    def _init_doe_parameters(self, requires_grad: bool, use_pretrained_doe: bool):
+        """Initialize the Rank-2 DOE parameters from pretrained vectors or analytically."""
+        if use_pretrained_doe:
+            # Load pretrained DOE vectors for left camera
+            init_x_0 = torch.load('doe_vector/x_0_l.pth')
+            init_y_0 = torch.load('doe_vector/y_0_l.pth')
+            init_x_1 = torch.load('doe_vector/x_1_l.pth')
+            init_y_1 = torch.load('doe_vector/y_1_l.pth')
+        else:
+            # Initialize DOE vectors analytically for left camera
+            n_param = self.mask_size // (2 * self.mask_upsample_factor)
+            n = torch.tensor(n_param, dtype=torch.float32)
+            y = torch.arange(n_param, dtype=torch.float32)
+            
+            init_x_0 = 2 * torch.ones(n_param).float()
+            init_x_1 = 4 * (1 - (torch.square(y)) / torch.square(n)).float()
+            init_y_0 = 2 * (1 - (torch.square(y)) / torch.square(n)).float()
+            init_y_1 = 4 * torch.ones(n_param).float()
         
-        return F.interpolate(self.heightmap1d_x_0.reshape(1, 1, -1),
-                             scale_factor=self.mask_upsample_factor, mode='nearest').reshape(-1)
-    def heightmap1d_y(self):
-        return F.interpolate(self.heightmap1d_y_0.reshape(1, 1, -1),
-                             scale_factor=self.mask_upsample_factor, mode='nearest').reshape(-1)
-    def heightmap1d_x1(self):
-        return F.interpolate(self.heightmap1d_x_1.reshape(1, 1, -1),
-                             scale_factor=self.mask_upsample_factor, mode='nearest').reshape(-1)
-    def heightmap1d_y1(self):
-        return F.interpolate(self.heightmap1d_y_1.reshape(1, 1, -1),
-                             scale_factor=self.mask_upsample_factor, mode='nearest').reshape(-1)
-
-    
-    # Rank 1 Coding
-    def heightmap2d(self):
-        return torch.matmul(self.heightmap1d_y().reshape(-1,1),self.heightmap1d_x().reshape(1,-1))+torch.matmul(self.heightmap1d_y1().reshape(-1,1),self.heightmap1d_x1().reshape(1,-1))
-
-    def forward_train(self, img, depthmap, occlusion):
-        return self.forward(img, depthmap, occlusion)
-    
-    def rot_matric(self,theta):
-        theta = torch.tensor(theta).cuda()
-        #return torch.tensor([[torch.cos(theta), -torch.sin(theta), 0],
-                            #[torch.sin(theta), torch.cos(theta), 0]])*torch.sqrt(torch.tensor(1.9))
-        return torch.tensor([[torch.cos(theta), -torch.sin(theta), 0],
-                            [torch.sin(theta), torch.cos(theta), 0]])
-    
-    def rot_height(self, x, theta):
-        rot_mat = self.rot_matric(theta).repeat(x.shape[0],1,1)
-        grid = F.affine_grid(rot_mat, x.size()).cuda()
-        x = F.grid_sample(x, grid, mode='bilinear', padding_mode='border')
-        return x
-
-    def aperture(self):
-        x = torch.arange(self.mask_size).float().cuda()
-        y = torch.arange(self.mask_size).float().cuda()
-        X, Y = torch.meshgrid(x, y)
-        r = torch.sqrt((X+0.5 - self.mask_size//2) ** 2 + (Y+0.5 - self.mask_size//2) ** 2)
-        aperture=torch.where(r<self.mask_size//2, 1, 0)
-        return aperture
-    def height(self):
-        heightmap2d=self.heightmap2d()
-        heightmap2d=copy_quadruple(heightmap2d.unsqueeze(0).unsqueeze(0))
-        heightmap2d=self.rot_height(heightmap2d, (torch.pi/4))
-        height_map=heightmap2d.squeeze(0).squeeze(0)
-        height_map=torch.remainder(height_map, 1)
-        height_map=height_map*self.aperture() 
-        return height_map.to(self.device)
-
-    def phase(self):
+        # Register as learnable parameters
+        self.heightmap1d_x_0 = nn.Parameter(init_x_0, requires_grad=requires_grad)
+        self.heightmap1d_y_0 = nn.Parameter(init_y_0, requires_grad=requires_grad)
+        self.heightmap1d_x_1 = nn.Parameter(init_x_1, requires_grad=requires_grad)
+        self.heightmap1d_y_1 = nn.Parameter(init_y_1, requires_grad=requires_grad)
         
-        heightmap=torch.remainder(self.height(),1)
-        k = 2 * torch.pi / self.wavelengths.reshape(-1,1,1,1)
-        phase = heightmap*k *self.h_max * (refractive_index(self.wavelengths.reshape(-1,1,1,1)) - 1)
-        phase=torch.remainder(phase, 2*torch.pi)
-        return phase
+    def _upsample_1d(self, vec: torch.Tensor) -> torch.Tensor:
+        """Upsample a 1D vector by the mask upsample factor."""
+        return F.interpolate(
+            vec.reshape(1, 1, -1),
+            scale_factor=self.mask_upsample_factor,
+            mode='nearest'
+        ).reshape(-1)
 
-    def through_plate(self, Ein, heightmap):
+    def heightmap1d_x(self) -> torch.Tensor:
+        """Get upsampled x-component of first rank term."""
+        return self._upsample_1d(self.heightmap1d_x_0)
+
+    def heightmap1d_y(self) -> torch.Tensor:
+        """Get upsampled y-component of first rank term."""
+        return self._upsample_1d(self.heightmap1d_y_0)
+
+    def heightmap1d_x1(self) -> torch.Tensor:
+        """Get upsampled x-component of second rank term."""
+        return self._upsample_1d(self.heightmap1d_x_1)
+
+    def heightmap1d_y1(self) -> torch.Tensor:
+        """Get upsampled y-component of second rank term."""
+        return self._upsample_1d(self.heightmap1d_y_1)
+
+    def heightmap2d(self) -> torch.Tensor:
+        """
+        Compute the 2D height map as sum of two outer products.
         
-        heightmap=heightmap.unsqueeze(0).unsqueeze(0)
-        #1.125*1e-6
-        k = 2 * torch.pi / self.wavelengths.reshape(-1,1,1,1)
-        phase = heightmap*k *self.h_max * (refractive_index(self.wavelengths.reshape(-1,1,1,1)) - 1)
-        return Ein*torch.exp(1j * phase)
+        Returns:
+            2D height map tensor of shape [H/2, W/2] (before quadruple copy)
+        """
+        term1 = torch.matmul(
+            self.heightmap1d_y().reshape(-1, 1),
+            self.heightmap1d_x().reshape(1, -1)
+        )
+        term2 = torch.matmul(
+            self.heightmap1d_y1().reshape(-1, 1),
+            self.heightmap1d_x1().reshape(1, -1)
+        )
+        return term1 + term2
 
-    def psf_obs(self, Ein):
-        '''r = self.focal_length/self.f_number/2
-        Mx, My = [1000,1000]#self.mask_size, self.mask_size
-        l=r*0.5'''
-        Mx, My = [256,256]
-        l=5.86e-6*Mx
-        z=1 / (1 / self.focal_length - 1 / self.focal_depth)
-        x = torch.linspace(-l / 2 , l / 2 , Mx)
-        y = torch.linspace(-l / 2 , l / 2 , My)    
-        device = self.device
-        prop2 = LeastSamplingASM(self, x, y, z, device)
-        U2 = prop2(Ein).cuda()
-        self.psf_phase=torch.remainder(torch.angle(U2), 2*torch.pi)
-        return abs(U2)**2
-    def psf_ph(self):
+    def _rotation_matrix(self, theta: float, device: torch.device) -> torch.Tensor:
+        """Create 2D rotation matrix for affine transformation."""
+        cos_t = torch.cos(torch.tensor(theta, device=device))
+        sin_t = torch.sin(torch.tensor(theta, device=device))
+        return torch.tensor([
+            [cos_t, -sin_t, 0],
+            [sin_t, cos_t, 0]
+        ], device=device)
+
+    def _rotate_height(self, x: torch.Tensor, theta: float) -> torch.Tensor:
+        """Apply rotation to height map using grid sampling."""
+        device = x.device
+        rot_mat = self._rotation_matrix(theta, device).unsqueeze(0).repeat(x.shape[0], 1, 1)
+        grid = F.affine_grid(rot_mat, x.size(), align_corners=False)
+        return F.grid_sample(x, grid, mode='bilinear', padding_mode='border', align_corners=False)
+
+    def aperture(self) -> torch.Tensor:
+        """Create circular aperture mask."""
+        x = torch.arange(self.mask_size, device=self.device).float()
+        y = torch.arange(self.mask_size, device=self.device).float()
+        X, Y = torch.meshgrid(x, y, indexing='ij')
+        r = torch.sqrt((X + 0.5 - self.mask_size // 2) ** 2 + 
+                       (Y + 0.5 - self.mask_size // 2) ** 2)
+        return torch.where(r < self.mask_size // 2, 1, 0).float()
+
+    def height(self) -> torch.Tensor:
+        """
+        Compute the full DOE height map.
+        
+        The height map is:
+        1. Computed from rank-2 representation
+        2. Copied to all four quadrants (symmetry)
+        3. Rotated by 45 degrees (for left camera)
+        4. Wrapped to [0, 1] range
+        5. Masked by circular aperture
+        
+        Returns:
+            Height map tensor [mask_size, mask_size] in [0, 1] range
+        """
+        heightmap2d = self.heightmap2d()
+        # Get the device from the computed heightmap (follows parameter device)
+        device = heightmap2d.device
+        heightmap2d = copy_quadruple(heightmap2d.unsqueeze(0).unsqueeze(0))
+        heightmap2d = self._rotate_height(heightmap2d, torch.pi / 4)  # +45° for left
+        height_map = heightmap2d.squeeze(0).squeeze(0)
+        height_map = torch.remainder(height_map, 1)
+        # Ensure aperture is on the same device as height_map
+        aperture = self.aperture().to(device)
+        height_map = height_map * aperture
+        return height_map
+
+    def phase(self) -> torch.Tensor:
+        """
+        Compute the phase map from height map.
+        
+        Returns:
+            Phase map tensor [n_wl, 1, mask_size, mask_size] in [0, 2π] range
+        """
+        heightmap = torch.remainder(self.height(), 1)
+        device = heightmap.device
+        wavelengths = self.wavelengths.to(device).reshape(-1, 1, 1, 1)
+        k = 2 * torch.pi / wavelengths
+        n = refractive_index(wavelengths)
+        phase = heightmap * k * self.H_MAX * (n - 1)
+        return torch.remainder(phase, 2 * torch.pi)
+
+    def through_plate(self, Ein: torch.Tensor, heightmap: torch.Tensor) -> torch.Tensor:
+        """
+        Propagate field through the DOE.
+        
+        Args:
+            Ein: Input electric field
+            heightmap: Height map of the DOE
+            
+        Returns:
+            Output electric field after phase modulation
+        """
+        device = heightmap.device
+        heightmap = heightmap.unsqueeze(0).unsqueeze(0)
+        wavelengths = self.wavelengths.to(device).reshape(-1, 1, 1, 1)
+        k = 2 * torch.pi / wavelengths
+        n = refractive_index(wavelengths)
+        phase = heightmap * k * self.H_MAX * (n - 1)
+        Ein = Ein.to(device)
+        return Ein * torch.exp(1j * phase)
+
+    def psf_obs(self, Ein: torch.Tensor) -> torch.Tensor:
+        """
+        Compute PSF at observation plane using LS-ASM.
+        
+        Args:
+            Ein: Input electric field
+            
+        Returns:
+            PSF intensity [n_wl, n_depths, H, W]
+        """
+        device = Ein.device
+        Mx, My = self.PSF_OBS_SIZE, self.PSF_OBS_SIZE
+        l = self.SENSOR_PIXEL_PITCH * Mx
+        z = 1 / (1 / self.focal_length - 1 / self.focal_depth)
+        
+        x = torch.linspace(-l / 2, l / 2, Mx, device=device)
+        y = torch.linspace(-l / 2, l / 2, My, device=device)
+        
+        prop = LeastSamplingASM(self, x, y, z, device)
+        U2 = prop(Ein)
+        self.psf_phase = torch.remainder(torch.angle(U2), 2 * torch.pi)
+        return torch.abs(U2) ** 2
+
+    def psf_ph(self) -> torch.Tensor:
+        """Get the phase of the PSF (for analysis)."""
         return self.psf_phase
-    def psf_obs_full(self, Ein):
-        #r = self.focal_length/self.f_number/2
-        #l = r * 0.25
-        Mx, My = self.full_size, self.full_size#[50,50] #self.full_size, self.full_size #self.mask_size, self.mask_size
-        l=5.86e-6*Mx
-        #xc=0; yc=0
-        z=1 / (1 / self.focal_length - 1 / self.focal_depth)
-        x = torch.linspace(-l / 2 , l / 2 , Mx)
-        y = torch.linspace(-l / 2 , l / 2 , My)    
-        device = self.device
-        prop2 = LeastSamplingASM(self, x, y, z, device)
-        U2 = prop2(Ein).cuda()
-        return abs(U2)**2
-    
-    def psf_full(self, modulate_phase):
-        if modulate_phase: 
-            Ein = self.through_plate(self.E0, self.height())
-        if not modulate_phase:
-            Ein = self.E0
-        psf_full = F.relu(self.psf_obs_full(Ein))
-        return psf_full
 
+    def psf_obs_full(self, Ein: torch.Tensor) -> torch.Tensor:
+        """Compute full-resolution PSF for regularization."""
+        device = Ein.device
+        Mx, My = self.full_size, self.full_size
+        l = self.SENSOR_PIXEL_PITCH * Mx
+        z = 1 / (1 / self.focal_length - 1 / self.focal_depth)
+        
+        x = torch.linspace(-l / 2, l / 2, Mx, device=device)
+        y = torch.linspace(-l / 2, l / 2, My, device=device)
+        
+        prop = LeastSamplingASM(self, x, y, z, device)
+        U2 = prop(Ein)
+        return torch.abs(U2) ** 2
 
-    def psf_at_camera(self, size, modulate_phase, is_training=torch.tensor(False)):
-        device = self.device
+    def psf_full(self, modulate_phase: bool) -> torch.Tensor:
+        """Compute full PSF with or without phase modulation."""
+        heightmap = self.height()
+        device = heightmap.device
+        E0 = self.E0.to(device)
+        if modulate_phase:
+            Ein = self.through_plate(E0, heightmap)
+        else:
+            Ein = E0
+        return F.relu(self.psf_obs_full(Ein))
+
+    def psf_at_camera(
+        self,
+        size: tuple,
+        modulate_phase: bool,
+        is_training: bool = False
+    ) -> torch.Tensor:
+        """
+        Compute PSF at camera sensor with optional augmentation.
+        
+        Args:
+            size: Output size (H, W)
+            modulate_phase: Whether to apply DOE phase modulation
+            is_training: Whether to apply training augmentations
+            
+        Returns:
+            PSF tensor [C, D, H, W]
+        """
         if not self.experiment:
-            heightmap=self.height()#.to(device)
+            heightmap = self.height()
+            device = heightmap.device
+            
+            # Optionally randomize depth sampling during training
             if is_training:
                 scene_distances = ips_to_metric(
                     torch.linspace(0, 1, steps=self.n_depths, device=device) +
                     1 / self.n_depths * (torch.rand(self.n_depths, device=device) - 0.5),
-                    self.min_depth, self.max_depth)
-                
+                    self.min_depth, self.max_depth
+                )
                 scene_distances[-1] += torch.rand(1, device=device)[0] * (100.0 - self.max_depth)
-            else:
-                scene_distances = ips_to_metric(torch.linspace(0, 1, steps=self.n_depths, device=device),
-                                                self.min_depth, self.max_depth)
-            #if modulate_phase: 
-                #Ein = self.through_plate(self.E0, heightmap)
-            #if not modulate_phase:
-                #Ein = self.E0
-            Ein = self.through_plate(self.E0, heightmap)
-
+            
+            # Compute PSF with phase modulation
+            E0 = self.E0.to(device)
+            Ein = self.through_plate(E0, heightmap)
             diffracted_psf = F.relu(self.psf_obs(Ein))
-            undiffracted_psf=F.relu(self.psf_obs(self.E0))
-            self.diff_normalization_scaler = torch.tensor(diffracted_psf.sum(dim=(-1, -2), keepdim=True))
+            undiffracted_psf = F.relu(self.psf_obs(E0))
+            
+            # Normalize PSFs
+            self.diff_normalization_scaler = diffracted_psf.sum(dim=(-1, -2), keepdim=True)
             self.undiff_normalization_scaler = undiffracted_psf.sum(dim=(-1, -2), keepdim=True)
-
             
             diffracted_psf = diffracted_psf / self.diff_normalization_scaler
             undiffracted_psf = undiffracted_psf / self.undiff_normalization_scaler
+            
+            # Combine diffracted and undiffracted PSFs
+            psf = (self.diffraction_efficiency * diffracted_psf + 
+                   (1 - self.diffraction_efficiency) * undiffracted_psf)
+        else:
+            # Use captured PSF for experiments
+            device = self.heightmap1d_x_0.device
+            psf = psf_captured(device)[0].squeeze(0).double()
 
-            psf = self.diffraction_efficiency * diffracted_psf + (1 - self.diffraction_efficiency) * undiffracted_psf
-        if self.experiment:
-            psf= psf_captured(device)[0].squeeze(0).double()
-        # In training, randomly pixel-shifts the PSF around green channel.
+        # Apply training augmentations
         if is_training:
-            psf=transforms.RandomRotation(1)(psf)
+            psf = transforms.RandomRotation(1)(psf)
             max_shift = 2
-            r_shift = tuple(torch.randint(-max_shift,max_shift, (2,)))
-            b_shift = tuple(torch.randint(-max_shift,max_shift, (2,)))
+            r_shift = tuple(torch.randint(-max_shift, max_shift, (2,)))
+            b_shift = tuple(torch.randint(-max_shift, max_shift, (2,)))
             psf_r = torch.roll(psf[0], shifts=r_shift, dims=(-1, -2))
             psf_g = psf[1]
             psf_b = torch.roll(psf[2], shifts=b_shift, dims=(-1, -2))
             psf = torch.stack([psf_r, psf_g, psf_b], dim=0)
-        #Blur the PSF
-        kernel_size=5
-        c,d,h,w=psf.shape
-        kernel=torch.tensor(cv2.getGaussianKernel(kernel_size, 0.5)).cuda()
-        kernel_2d=(kernel*kernel.T)
-        for i in range(c):
-                for j in range(d):
-                    psf[[i],[j],...]=F.conv2d(psf[[i],[j],...], kernel_2d.expand(1,1,kernel_size,kernel_size), padding=((kernel_size-1)//2,(kernel_size-1)//2))
+
+        # Apply Gaussian blur to PSF
+        psf = self._blur_psf(psf, kernel_size=5, sigma=0.5)
         
-        psf=transforms.CenterCrop(size)(psf)
-        #psf = F.pad(psf, (pad_w, pad_w, pad_h, pad_h), mode='constant', value=0)
-        #psf= fftshift(psf, dims=(-1, -2))
-        #psf = F.interpolate(psf.unsqueeze(0), size=(self.n_depths, psf.shape[-2], psf.shape[-1]), mode='trilinear', align_corners=False)
+        # Crop to target size
+        psf = transforms.CenterCrop(size)(psf)
         return psf.squeeze(0)
 
-
-    def psf_out_of_fov_energy(self, psf_size: int):
-        # As this quadruple will be copied to the other three, rho = 0 is avoided.
-        device = 'cuda' #if torch.cuda.is_available() else 'cpu'
+    def _blur_psf(
+        self,
+        psf: torch.Tensor,
+        kernel_size: int = 5,
+        sigma: float = 0.5
+    ) -> torch.Tensor:
+        """Apply Gaussian blur to PSF for realistic simulation."""
+        device = psf.device
+        dtype = psf.dtype
+        c, d, h, w = psf.shape
+        kernel = torch.tensor(cv2.getGaussianKernel(kernel_size, sigma), device=device, dtype=dtype)
+        kernel_2d = kernel * kernel.T
         
+        for i in range(c):
+            for j in range(d):
+                psf[[i], [j], ...] = F.conv2d(
+                    psf[[i], [j], ...],
+                    kernel_2d.expand(1, 1, kernel_size, kernel_size),
+                    padding=((kernel_size - 1) // 2, (kernel_size - 1) // 2)
+                )
+        return psf
+
+    def psf_out_of_fov_energy(self, psf_size: int) -> torch.Tensor:
+        """
+        Compute PSF energy outside the field of view for regularization.
+        
+        This encourages the PSF to be compact and within the valid region.
+        
+        Args:
+            psf_size: Size parameter (unused, kept for API compatibility)
+            
+        Returns:
+            Scalar loss value for out-of-FOV energy
+        """
         psf_diffracted = self.psf_full(self.modulate_phase)
-
-        try: 
-            psf_diffracted = psf_diffracted / (self.diff_normalization_scaler)           
-        except:
-            psf_diffracted = psf_diffracted 
-       
-        # Cross Mask
-        mask_c= torch.ones_like(psf_diffracted)
-        center= mask_c.shape[-1]//2
-
+        device = psf_diffracted.device
         
-        #mask = torch.zeros(100, 100)
-        x = torch.arange(2*center).float().cuda()
-        y = torch.arange(2*center).float().cuda()
-
-        X, Y = torch.meshgrid(x, y)
-        X=X.cuda()
-        Y=Y.cuda()
-        dist= torch.sqrt((X+0.5 - center) ** 2 + (Y+0.5 - center) ** 2).cuda()
-        dist2=torch.where(dist>10, 1, 0).cuda()
-        mask_c[..., :, :]=dist2 
-        # Regularization for Rank 1 and Rank 2
-        psf_out_of_fov = (psf_diffracted * mask_c).float()
+        try:
+            psf_diffracted = psf_diffracted / self.diff_normalization_scaler.to(device)
+        except AttributeError:
+            pass
         
-        return psf_out_of_fov.sum()/10
+        # Create circular mask to exclude center region
+        mask = torch.ones_like(psf_diffracted)
+        center = mask.shape[-1] // 2
+        
+        x = torch.arange(2 * center, device=device).float()
+        y = torch.arange(2 * center, device=device).float()
+        X, Y = torch.meshgrid(x, y, indexing='ij')
+        
+        dist = torch.sqrt((X + 0.5 - center) ** 2 + (Y + 0.5 - center) ** 2)
+        outer_mask = torch.where(dist > 10, 1, 0)
+        mask[..., :, :] = outer_mask
+        
+        # Compute out-of-FOV energy
+        psf_out_of_fov = (psf_diffracted * mask).float()
+        return psf_out_of_fov.sum() / 10
 
-    def forward_train(self, img, depthmap, occlusion):
-        return self.forward(img, depthmap, occlusion, is_training=torch.tensor(True), modulate_phase=self.modulate_phase)
+    def forward_train(
+        self,
+        img: torch.Tensor,
+        depthmap: torch.Tensor,
+        occlusion: bool
+    ) -> tuple:
+        """Forward pass with training augmentations enabled."""
+        return self.forward(
+            img, depthmap, occlusion,
+            is_training=True,
+            modulate_phase=self.modulate_phase
+        )
 
     def set_diffraction_efficiency(self, de: float):
+        """Set the diffraction efficiency of the DOE."""
         self.diffraction_efficiency = de
-
-
-
-
-
