@@ -51,7 +51,6 @@ class TrainingConfig:
     augment: bool = True
     mixed_precision: bool = True
     num_steps: int = 200000
-    wdecay: float = 0.00001
     
     # Random seed
     seed: int = 666
@@ -77,11 +76,9 @@ class DatasetConfig:
     crop_width: int = 0
     
     # Data augmentation
-    img_gamma: Optional[List[float]] = None
     saturation_range: List[float] = field(default_factory=lambda: [0.0, 1.4])
     do_flip: Union[bool, str] = False
     spatial_scale: List[float] = field(default_factory=lambda: [-0.2, 0.4])
-    noyjitter: bool = False
 
 
 @dataclass 
@@ -137,8 +134,6 @@ class IGEVConfig:
     train_iters: int = 6
     valid_iters: int = 12
     hidden_dims: List[int] = field(default_factory=lambda: [128, 128, 128])
-    corr_implementation: str = 'reg'  # Options: reg, alt, reg_cuda, alt_cuda
-    shared_backbone: bool = False
     corr_levels: int = 2
     corr_radius: int = 4
     n_downsample: int = 2
@@ -215,7 +210,6 @@ class Config:
             'augment': self.training.augment,
             'mixed_precision': self.training.mixed_precision,
             'num_steps': self.training.num_steps,
-            'wdecay': self.training.wdecay,
         })
         
         # Loss params
@@ -234,11 +228,9 @@ class Config:
             'min_depth': self.dataset.min_depth,
             'max_depth': self.dataset.max_depth,
             'crop_width': self.dataset.crop_width,
-            'img_gamma': self.dataset.img_gamma,
             'saturation_range': self.dataset.saturation_range,
             'do_flip': self.dataset.do_flip,
             'spatial_scale': self.dataset.spatial_scale,
-            'noyjitter': self.dataset.noyjitter,
         })
         
         # Solver params
@@ -278,8 +270,6 @@ class Config:
             'train_iters': self.igev.train_iters,
             'valid_iters': self.igev.valid_iters,
             'hidden_dims': self.igev.hidden_dims,
-            'corr_implementation': self.igev.corr_implementation,
-            'shared_backbone': self.igev.shared_backbone,
             'corr_levels': self.igev.corr_levels,
             'corr_radius': self.igev.corr_radius,
             'n_downsample': self.igev.n_downsample,

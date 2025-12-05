@@ -36,6 +36,7 @@ imageio.plugins.freeimage.download()
 # Import config module for YAML configuration support
 try:
     from config import load_config, config_to_namespace
+
     CONFIG_AVAILABLE = True
 except ImportError:
     CONFIG_AVAILABLE = False
@@ -81,72 +82,21 @@ def prepare_data(hparams):
         singleplane=False
     )
     
-    if hparams.mix_instereo_dataset:
-        # Mix with InStereo2k dataset
-        train_datasets = []
-        val_datasets = []
-        sample_weights_list = []
-        
-        is_train_dataset = InStereo2k(
-            'train',
-            (image_sz[0] + 4 * crop_width, image_sz[1] + 4 * crop_width),
-            is_training=True,
-            augment=augment,
-            padding=padding,
-            singleplane=False
-        )
-        n_is = len(is_train_dataset)
-        
-        is_val_dataset = InStereo2k(
-            'val',
-            (image_sz[0] + 4 * crop_width, image_sz[1] + 4 * crop_width),
-            is_training=False,
-            augment=augment,
-            padding=padding,
-            singleplane=False,
-            hparams=hparams
-        )
-
-        train_datasets.append(is_train_dataset)
-        val_datasets.append(is_val_dataset)
-        sample_weights_list.append(1.0 / n_is * torch.ones(n_is, dtype=torch.double))
-        
-        train_dataset = ConcatDataset(train_datasets)
-        val_dataset = ConcatDataset(val_datasets)
-        sample_weights = torch.cat(sample_weights_list, dim=0)
-        sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights))
-
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=hparams.batch_sz,
-            sampler=sampler,
-            num_workers=hparams.num_workers,
-            shuffle=False,
-            pin_memory=True
-        )
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=hparams.batch_sz,
-            num_workers=hparams.num_workers,
-            shuffle=False,
-            pin_memory=True
-        )
-    else:
-        # Use SceneFlow only
-        train_dataloader = DataLoader(
-            sf_train_dataset,
-            batch_size=hparams.batch_sz,
-            num_workers=hparams.num_workers,
-            shuffle=True,
-            pin_memory=True
-        )
-        val_dataloader = DataLoader(
-            sf_val_dataset,
-            batch_size=hparams.batch_sz,
-            num_workers=hparams.num_workers,
-            shuffle=False,
-            pin_memory=True
-        )
+    # Use SceneFlow only
+    train_dataloader = DataLoader(
+        sf_train_dataset,
+        batch_size=hparams.batch_sz,
+        num_workers=hparams.num_workers,
+        shuffle=True,
+        pin_memory=True
+    )
+    val_dataloader = DataLoader(
+        sf_val_dataset,
+        batch_size=hparams.batch_sz,
+        num_workers=hparams.num_workers,
+        shuffle=False,
+        pin_memory=True
+    )
 
     return train_dataloader, val_dataloader
 

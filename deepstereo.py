@@ -172,7 +172,7 @@ class Stereo3D(pl.LightningModule):
                     original_images_left, original_images_right, original_images_left_m, original_images_right_m, 
                     target_depthmaps,  target_depthmaps_m, target_norm_depthmaps, target_norm_depthmaps_m,
                     original_depthmaps, original_depthmaps_m ,disparity, disparity_2]
-        outputs = self.forward(*input_args)
+        outputs = self.forward(*input_args, is_training=True)
         target_images_left = outputs.target_images_left
         target_images_right = outputs.target_images_right
         
@@ -229,7 +229,7 @@ class Stereo3D(pl.LightningModule):
                 disparity, disparity_2
             ]
 
-            outputs = self.forward(*input_args)
+            outputs = self.forward(*input_args, is_training=False)
 
             # Unpack outputs
             est_images_left = outputs.est_images_left
@@ -245,28 +245,31 @@ class Stereo3D(pl.LightningModule):
             target_depthmaps_m = outputs.target_depthmaps_m
             target_roughdepth = outputs.target_roughdepth
             target_roughdepth_m = outputs.target_roughdepth_m
-            self.outputs = outputs
             
             # Create valid masks for disparity evaluation
             valid = ((target_roughdepth >= 0.5) & (target_roughdepth < self.hparams.max_disp))
             valid_m = ((target_roughdepth_m >= 0.5) & (target_roughdepth_m < self.hparams.max_disp))
             assert valid.shape == target_roughdepth.shape, [valid.shape, target_roughdepth.shape]
             assert not torch.isinf(target_roughdepth[valid.bool()]).any()
+            assert valid_m.shape == target_roughdepth_m.shape, [valid_m.shape, target_roughdepth_m.shape]
+            assert not torch.isinf(target_roughdepth_m[valid_m.bool()]).any()
 
             # Compute metrics
             depth_mse = mse(est_depthmaps, target_depthmaps)
             depth_epe = mae((est_depthmaps) * 255, (target_depthmaps) * 255)
-            depth_3px = calculate_3px((est_depthmaps) * 255, (target_depthmaps) * 255)
             epe_match = mae(rough_depth[valid.bool()], target_roughdepth[valid.bool()])
             img_mse = mse(est_images_left, target_images_left)
 
             depth_mse_m = mse(est_depthmaps_m, target_depthmaps_m)
             depth_epe_m = mae((est_depthmaps_m) * 255, (target_depthmaps_m) * 255)
-            depth_3px_m = calculate_3px((est_depthmaps_m) * 255, (target_depthmaps_m) * 255)
-            epe_match_m = mae(rough_depth_m[valid.bool()], target_roughdepth_m[valid.bool()])
+            epe_match_m = mae(rough_depth_m[valid_m.bool()], target_roughdepth_m[valid_m.bool()])
             img_mse_m = mse(est_images_left_m, target_images_left_m)
             
+            # Compute val_loss
+            val_loss, _ = self.__compute_loss(outputs)
+            
             # Log validation metrics
+            self.log('val_loss', val_loss, on_step=False, on_epoch=True, prog_bar=True)
             self.log('validation/mse_depthmap', depth_mse, on_step=False, on_epoch=True)
             self.log('validation/mse_depthmap_m', depth_mse_m, on_step=False, on_epoch=True)
             self.log('validation/depth_epe', depth_epe, on_step=False, on_epoch=True)
@@ -279,21 +282,14 @@ class Stereo3D(pl.LightningModule):
             self.log('validation/ssim', calculate_ssim(est_images_left, target_images_left), on_step=False, on_epoch=True)
             self.log('validation/ssim_mirror', calculate_ssim(est_images_left_m, target_images_left_m), on_step=False, on_epoch=True)
             
-            if batch_idx ==0:
+            if batch_idx == 0:
                 self.__log_images(outputs, target_images_left, target_depthmaps,
                                   target_images_left_m, target_depthmaps_m, 'validation')
-           
-    def validation_epoch_end(self,outputs):
-        
-        outputs=self.outputs
-        with torch.no_grad():
-            val_loss, _= self.__compute_loss(outputs)
-        self.log('val_loss', val_loss)
     
     def forward(self, left_images,right_images,
                 original_left, original_right, original_left_m, original_right_m, 
                 depthmaps, depthmaps_m, depthmaps_norm, depthmaps_norm_m,
-                original_depth, original_depth_m, disparity, disparity_2):
+                original_depth, original_depth_m, disparity, disparity_2, is_training=True):
         
         hparams=self.hparams
         # invert the gamma correction for sRGB image
@@ -364,8 +360,11 @@ class Stereo3D(pl.LightningModule):
 
             pinv_volumes_left_m, pinv_volumes_right_m = pinv_volumes_left,pinv_volumes_right
 
-        est_1, est_sq = self.matching(linear_to_srgb(captimgs_left)*255, linear_to_srgb(captimgs_right)*255, iters=hparams.train_iters)
-        est_1_m, est_m_sq = self.matching(linear_to_srgb(captimgs_left_m)*255, linear_to_srgb(captimgs_right_m)*255, iters=hparams.train_iters) 
+        # Use different iteration counts for training vs validation
+        iters = hparams.train_iters if is_training else getattr(hparams, 'valid_iters', hparams.train_iters)
+        
+        est_1, est_sq = self.matching(linear_to_srgb(captimgs_left)*255, linear_to_srgb(captimgs_right)*255, iters=iters)
+        est_1_m, est_m_sq = self.matching(linear_to_srgb(captimgs_left_m)*255, linear_to_srgb(captimgs_right_m)*255, iters=iters) 
         est=est_sq[-1]
         est_m=est_m_sq[-1]
         batch = captimgs_left.shape[0]
@@ -377,7 +376,6 @@ class Stereo3D(pl.LightningModule):
         norm_max_m = torch.zeros(batch, device=device)
         norm_min_m = torch.zeros(batch, device=device)
 
-        dataNew = 'DOE_left.mat'
 
         for i in range(batch):
             # Ensure depthmaps are on the same device before computing max/min
@@ -389,7 +387,7 @@ class Stereo3D(pl.LightningModule):
 
         if hparams.warp_img:
             self.warping = Warp()
-            b, c, h, w = est.shape
+            _, _, h, w = est.shape
             w_disparity=F.interpolate(est, size=(int(h/hparams.scale), int(w/hparams.scale)), mode='bilinear', align_corners=False)
             w_disparity_2=F.interpolate(self.flip(est_m), size=(int(h/hparams.scale), int(w/hparams.scale)), mode='bilinear', align_corners=False)
             
@@ -588,12 +586,12 @@ class Stereo3D(pl.LightningModule):
         hparams = self.hparams
         target_depthmaps=outputs.target_depthmaps
         target_images_left=outputs.target_images_left
-        target_images_right=outputs.target_images_right  # 添加右图目标
+        target_images_right=outputs.target_images_right  
         target_depthmaps_m=outputs.target_depthmaps_m
         target_images_left_m=outputs.target_images_left_m
-        target_images_right_m=outputs.target_images_right_m  # 添加镜像右图目标
+        target_images_right_m=outputs.target_images_right_m  
         est_images_left = outputs.est_images_left
-        est_images_right = outputs.est_images_right  # 添加右图重建
+        est_images_right = outputs.est_images_right  
         est_1=outputs.est_1
         est=outputs.est
         est_depthmaps = outputs.est_depthmaps
@@ -601,7 +599,7 @@ class Stereo3D(pl.LightningModule):
         target_roughdepth= outputs.target_roughdepth
         # Mirror
         est_images_left_m = outputs.est_images_left_m
-        est_images_right_m = outputs.est_images_right_m  # 添加镜像右图重建
+        est_images_right_m = outputs.est_images_right_m  
         est_1_m=outputs.est_1_m
         est_m=outputs.est_m
         est_depthmaps_m = outputs.est_depthmaps_m
@@ -610,12 +608,8 @@ class Stereo3D(pl.LightningModule):
 
         psnr_left = calculate_psnr(est_images_left, target_images_left)
         ssmi_left = calculate_ssim(est_images_left, target_images_left)
-        
-        # 左图重建损失
         left_image_loss = self.image_lossfn.train_loss(est_images_left, target_images_left)
         left_image_loss_m = self.image_lossfn.train_loss(est_images_left_m, target_images_left_m)
-        
-        # 添加右图重建损失 - 直接监督右相机
         right_image_loss = self.image_lossfn.train_loss(est_images_right, target_images_right)
         right_image_loss_m = self.image_lossfn.train_loss(est_images_right_m, target_images_right_m)
         
@@ -623,19 +617,22 @@ class Stereo3D(pl.LightningModule):
         valid_m = ((target_roughdepth_m >= 0.5) & (target_roughdepth_m < hparams.max_disp))
         disp_loss = 0.0
         disp_loss_m = 0.0
-        for i in range(hparams.train_iters):
+        
+        # Use actual sequence length instead of hparams.train_iters
+        num_iters = len(outputs.est_sq)
+        for i in range(num_iters):
             est_s = outputs.est_sq[i]
             est_s_m = outputs.est_sq_m[i]
             loss_gamma = 0.9
-            adjusted_loss_gamma = loss_gamma**(15/(hparams.train_iters - 1))
-            i_weight = adjusted_loss_gamma**(hparams.train_iters - i - 1)
+            adjusted_loss_gamma = loss_gamma**(15/(num_iters - 1))
+            i_weight = adjusted_loss_gamma**(num_iters - i - 1)
             i_loss = (target_roughdepth - est_s).abs()
             i_loss_m = (target_roughdepth_m - est_s_m).abs()
             disp_loss += i_weight * i_loss[valid.bool()].mean()
             disp_loss_m += i_weight * i_loss_m[valid_m.bool()].mean()
 
-        disp_loss/=hparams.train_iters
-        disp_loss_m/=hparams.train_iters
+        disp_loss/=num_iters
+        disp_loss_m/=num_iters
         depth_1_loss=disp_loss+mae(est_1[valid.bool()], target_roughdepth[valid.bool()])
         depth_2_loss=mae(est[valid.bool()], target_roughdepth[valid.bool()])
         depth_2_loss_all=mae(est, target_roughdepth)
@@ -654,13 +651,12 @@ class Stereo3D(pl.LightningModule):
         psf_right_out_of_fov_sum = self.camera_right.psf_out_of_fov_energy(hparams.psf_size)
         psf_right_loss = psf_right_out_of_fov_sum
         
-        # 合并图像损失：左图 + 右图（对称监督）
         total_image_loss = (left_image_loss + left_image_loss_m + right_image_loss + right_image_loss_m) / 2
         
         total_loss = self.__combine_loss(
             (epe_loss + epe_loss_m + dfd_loss + dfd_loss_m) / 10, 
             (depth_2_loss + depth_2_loss_m) / 2 + (depth_1_loss + depth_1_loss_m) / 4, 
-            total_image_loss,  # 使用合并后的图像损失
+            total_image_loss,  
             psf_left_loss + psf_right_loss
         )
         
@@ -670,7 +666,7 @@ class Stereo3D(pl.LightningModule):
             'disp_loss': depth_2_loss, 
             'disp_loss_all': depth_2_loss_all, 
             'left_image_loss': left_image_loss,
-            'right_image_loss': right_image_loss,  # 添加右图损失日志
+            'right_image_loss': right_image_loss,  
             'psf_loss_left': psf_left_loss,
             'psf_loss_right': psf_right_loss,
             'left_image_psnr': psnr_left,
@@ -869,15 +865,12 @@ class Stereo3D(pl.LightningModule):
         parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
         parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
         parser.add_argument('--train_iters', type=int, default=12, help="number of updates to the disparity field in each forward pass.")
-        parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
-
+        
         # Validation parameters
         parser.add_argument('--valid_iters', type=int, default=16, help='number of flow-field updates during validation forward pass')
 
         # Architecure choices
         parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
-        parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
-        parser.add_argument('--shared_backbone', action='store_true', help="use a single backbone for the context and feature encoders")
         parser.add_argument('--corr_levels', type=int, default=2, help="number of levels in the correlation pyramid")
         parser.add_argument('--corr_radius', type=int, default=4, help="width of the correlation pyramid")
         parser.add_argument('--n_downsample', type=int, default=2, help="resolution of the disparity field (1/2^K)")
@@ -886,11 +879,9 @@ class Stereo3D(pl.LightningModule):
         parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
 
         # Data augmentation
-        parser.add_argument('--img_gamma', type=float, nargs='+', default=None, help="gamma range")
         parser.add_argument('--saturation_range', type=float, nargs='+', default=[0, 1.4], help='color saturation')
         parser.add_argument('--do_flip', default=False, choices=['h', 'v'], help='flip the images horizontally or vertically')
         parser.add_argument('--spatial_scale', type=float, nargs='+', default=[-0.2, 0.4], help='re-scale the images randomly')
-        parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
         torch.manual_seed(666)
 
         return parser

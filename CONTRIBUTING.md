@@ -7,7 +7,7 @@ Thank you for your interest in contributing to Deep Stereo! This document provid
 1. **Fork the repository** on GitHub
 2. **Clone your fork** locally:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/deep_stereo.git
+   git clone https://github.com/Lorena-Y-Liu/deep_stereo.git
    cd deep_stereo
    ```
 3. **Create a virtual environment** and install dependencies:

@@ -59,7 +59,7 @@ training:
   # Learning rates
   cnn_lr: 5e-4               # CNN network learning rate
   depth_lr: 1e-4           # Depth estimation learning rate
-  optics_lr: 1e-3              # Optics learning rate (set to 0 to disable)
+  optics_lr: 0.5e-3              # Optics learning rate (set to 0 to disable)
   
   # Batch and data loading
   batch_sz: 1
@@ -70,7 +70,6 @@ training:
   num_steps: 200000
   augment: true               # Data augmentation
   mixed_precision: true       # Mixed precision training
-  wdecay: 0.00001             # Weight decay
   
   # Random seed
   seed: 666
@@ -81,8 +80,8 @@ training:
 loss:
   depth_loss_weight: 1.0
   depth_1_loss_weight: 1.0
-  image_loss_weight: 5.0
-  psf_loss_weight: 0.001
+  image_loss_weight: 3.0
+  psf_loss_weight: 0.01
   psf_size: 160
 
 # -----------------------------------------------------------------------------
@@ -96,11 +95,9 @@ dataset:
   crop_width: 0
   
   # Data augmentation parameters
-  img_gamma: null
   saturation_range: [0.0, 1.4]
   do_flip: false
   spatial_scale: [-0.2, 0.4]
-  noyjitter: false
 
 # -----------------------------------------------------------------------------
 # Solver Parameters
@@ -118,8 +115,6 @@ igev:
   train_iters: 8             # Training iterations
   valid_iters: 16             # Validation iterations
   hidden_dims: [128, 128, 128]
-  corr_implementation: reg    # Options: reg, alt, reg_cuda, alt_cuda
-  shared_backbone: false
   corr_levels: 2
   corr_radius: 4
   n_downsample: 2
