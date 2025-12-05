@@ -2,13 +2,13 @@
 
 Official PyTorch implementation of **"Learned binocular-encoding optics for RGBD imaging using joint stereo and focus cues"**.
 
-🌐 **[Project Page](https://liangxunou.github.io/25liulearned/)** | 📄 **[Paper](https://openaccess.thecvf.com/content/CVPR2025/papers/Liu_Learned_Binocular-Encoding_Optics_for_RGBD_Imaging_Using_Joint_Stereo_and_CVPR_2025_paper.pdf)** | 💻 **[Code](https://github.com/Lorena-Y-Liu/Learned-Binocular-Optics)**
+🌐 **[Project Page](https://liangxunou.github.io/25liulearned/)** | 📄 **[Paper](https://openaccess.thecvf.com/content/CVPR2025/papers/Liu_Learned_Binocular-Encoding_Optics_for_RGBD_Imaging_Using_Joint_Stereo_and_CVPR_2025_paper.pdf)** | 💻 **[Code](https://github.com/Lorena-Y-Liu/Learned-Binocular-Optics)** | 📒 **[Supplementary](https://openaccess.thecvf.com/content/CVPR2025/supplemental/Liu_Learned_Binocular-Encoding_Optics_CVPR_2025_supplemental.pdf)
 
 ## Overview
 
 This project implements a novel RGBD imaging system that combines:
 - **Diffractive Optical Elements (DOE)**: Learnable phase masks for depth-dependent Point Spread Functions (PSF)
-- **Stereo Vision**: Dual-camera setup for disparity-based depth estimation
+- **Stereo Vision**: Learned binocular camera setup for RGB imaging and disparity-based depth estimation
 - **Joint Optimization**: End-to-end training of both optical elements and neural network components
 
 ![Teaser](docs/teaser.png)
