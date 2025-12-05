@@ -2,7 +2,7 @@
 
 Official PyTorch implementation of **"Learned binocular-encoding optics for RGBD imaging using joint stereo and focus cues"**.
 
-🌐 **[Project Page](https://liangxunou.github.io/25liulearned/)** | 📄 **Paper** | 💻 **Code**
+🌐 **[Project Page](https://liangxunou.github.io/25liulearned/)** | 📄 **[Paper](https://openaccess.thecvf.com/content/CVPR2025/papers/Liu_Learned_Binocular-Encoding_Optics_for_RGBD_Imaging_Using_Joint_Stereo_and_CVPR_2025_paper.pdf)** | 💻 **[Code](https://github.com/Lorena-Y-Liu/Learned-Binocular-Optics)**
 
 ## Overview
 
