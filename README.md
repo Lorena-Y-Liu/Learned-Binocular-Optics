@@ -83,6 +83,7 @@ conda activate deep_stereo
 
 # Install dependencies
 pip install -r requirements.txt
+pip install git+https://github.com/cheind/pytorch-debayer@v1.0
 ```
 
 ### Dependencies
