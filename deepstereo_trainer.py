@@ -14,11 +14,8 @@ import os
 import warnings
 from argparse import ArgumentParser
 
-# Suppress specific warnings
-warnings.filterwarnings("ignore", message="Default grid_sample and affine_grid behavior has changed")
-warnings.filterwarnings("ignore", message="Importing `spectral_angle_mapper` from `torchmetrics.functional` was deprecated")
-warnings.filterwarnings("ignore", category=FutureWarning, module="torchmetrics")
-warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.functional")
+# Suppress all warnings
+warnings.filterwarnings("ignore")
 
 import torch
 import imageio
@@ -44,8 +41,13 @@ except ImportError:
 seed_everything(123)
 
 # GPU configuration
-GPU_ID = '4'
+GPU_ID = '1'
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
+
+# Configure PyTorch CUDA memory allocator to reduce fragmentation
+# This helps prevent OOM errors when memory is fragmented
+# Increased from 128 to 256 to better handle the 2.5GB fragmentation issue
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
 
 
 def prepare_data(hparams):
@@ -82,6 +84,14 @@ def prepare_data(hparams):
         singleplane=False
     )
     
+    # Get validation batch size (use val_batch_sz if set, otherwise fallback to batch_sz)
+    val_batch_size = getattr(hparams, 'val_batch_sz', hparams.batch_sz)
+    
+    print(f"DataLoader Configuration:")
+    print(f"  Training batch size: {hparams.batch_sz}")
+    print(f"  Validation batch size: {val_batch_size}")
+    print(f"  Number of workers: {hparams.num_workers}")
+    
     # Use SceneFlow only
     train_dataloader = DataLoader(
         sf_train_dataset,
@@ -92,7 +102,7 @@ def prepare_data(hparams):
     )
     val_dataloader = DataLoader(
         sf_val_dataset,
-        batch_size=hparams.batch_sz,
+        batch_size=val_batch_size,
         num_workers=hparams.num_workers,
         shuffle=False,
         pin_memory=True
@@ -115,17 +125,35 @@ def main(args):
             config = load_config(config_path)
             args = config_to_namespace(config, args)
             print(f"Loaded configuration from: {config_path}")
+            # Print a short summary to confirm the YAML config is actually applied
+            try:
+                print(
+                    "[Config Applied] "
+                    f"cnn_lr={getattr(args, 'cnn_lr', None)}, "
+                    f"depth_lr={getattr(args, 'depth_lr', None)}, "
+                    f"optics_lr={getattr(args, 'optics_lr', None)}, "
+                    f"mixed_precision={getattr(args, 'mixed_precision', None)}, "
+                    f"depth_loss_weight={getattr(args, 'depth_loss_weight', None)}, "
+                    f"depth_1_loss_weight={getattr(args, 'depth_1_loss_weight', None)}, "
+                    f"image_loss_weight={getattr(args, 'image_loss_weight', None)}, "
+                    f"psf_loss_weight={getattr(args, 'psf_loss_weight', None)}"
+                )
+            except Exception:
+                pass
         else:
-            print(f"Warning: Config file not found at {config_path}, using command-line args only.")
+            pass  # Config file not found, using command-line args
     
     # Setup logger and callbacks
     logger = TensorBoardLogger(args.default_root_dir, name=args.experiment_name)
     logmanager_callback = LogManager()
+    
+    # Since validation may have all NaN batches initially, just save periodically
+    # without monitoring a specific metric to avoid errors
     checkpoint_callback = ModelCheckpoint(
         verbose=True,
-        monitor='val_loss',
-        filepath=os.path.join(logger.log_dir, 'checkpoints', '{epoch}-{val_loss:.4f}'),
-        save_top_k=1,
+        monitor=None,  # Don't monitor any metric, just save periodically
+        filepath=os.path.join(logger.log_dir, 'checkpoints', '{epoch:02d}'),
+        save_top_k=None,  # Save all checkpoints when monitor=None
         period=1,
         mode='min'
     )
@@ -141,6 +169,8 @@ def main(args):
         logger=logger,
         callbacks=[logmanager_callback],
         checkpoint_callback=checkpoint_callback,
+        # Guard against exploding gradients / NaNs
+        gradient_clip_val=1.0,
         sync_batchnorm=True,
         benchmark=True,
         val_check_interval=0.5

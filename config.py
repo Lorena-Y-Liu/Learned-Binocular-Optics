@@ -38,12 +38,13 @@ class LoggerConfig:
 class TrainingConfig:
     """Training hyperparameters."""
     # Learning rates
-    cnn_lr: float = 1e-3
-    depth_lr: float = 1e-5
-    optics_lr: float = 0.0
+    cnn_lr: float = 1e-4
+    depth_lr: float = 1e-6
+    optics_lr: float = 0.5e-3
     
     # Batch and workers
     batch_sz: int = 1
+    val_batch_sz: int = 1  # Validation batch size (can be larger than training)
     num_workers: int = 8
     
     # Training settings
@@ -60,10 +61,20 @@ class TrainingConfig:
 class LossConfig:
     """Loss function weights."""
     depth_loss_weight: float = 1.0
-    depth_1_loss_weight: float = 0.0
-    image_loss_weight: float = 1.0
-    psf_loss_weight: float = 0.0
+    depth_1_loss_weight: float = 0.05
+    image_loss_weight: float = 3.0
+    psf_loss_weight: float = 0.01
     psf_size: int = 160
+
+    # Optional fine-grained supervision weights (kept here for YAML compatibility)
+    dfd_term_weight: float = 5.0
+    epe_term_weight: float = 0.1
+    disp2_term_weight: float = 0.5
+    disp1_term_weight: float = 0.25
+
+    # Optional diagnostics cadence (steps); set to 0 to disable
+    diag_every_n_steps: int = 200
+    grad_diag_every_n_steps: int = 200
 
 
 @dataclass
@@ -206,6 +217,7 @@ class Config:
             'depth_lr': self.training.depth_lr,
             'optics_lr': self.training.optics_lr,
             'batch_sz': self.training.batch_sz,
+            'val_batch_sz': self.training.val_batch_sz,
             'num_workers': self.training.num_workers,
             'augment': self.training.augment,
             'mixed_precision': self.training.mixed_precision,
@@ -219,6 +231,14 @@ class Config:
             'image_loss_weight': self.loss.image_loss_weight,
             'psf_loss_weight': self.loss.psf_loss_weight,
             'psf_size': self.loss.psf_size,
+
+            # Fine-grained weights / diagnostics
+            'dfd_term_weight': self.loss.dfd_term_weight,
+            'epe_term_weight': self.loss.epe_term_weight,
+            'disp2_term_weight': self.loss.disp2_term_weight,
+            'disp1_term_weight': self.loss.disp1_term_weight,
+            'diag_every_n_steps': self.loss.diag_every_n_steps,
+            'grad_diag_every_n_steps': self.loss.grad_diag_every_n_steps,
         })
         
         # Dataset params

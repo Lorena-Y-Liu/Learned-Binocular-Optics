@@ -20,16 +20,24 @@ def mdft(in_matrix, x, y, fx, fy):
     y = y.unsqueeze(-2)
     fx = fx.unsqueeze(-2)
     fy = fy.unsqueeze(-1)
+    
+    # Compute mx and my, then delete intermediate tensors to free memory
     mx = torch.exp(-2 * torch.pi * 1j * torch.matmul(x, fx))
     my = torch.exp(-2 * torch.pi * 1j * torch.matmul(fy, y))
-    out_matrix = torch.matmul(torch.matmul(my, in_matrix), mx)
+    
+    # Perform matrix multiplication in steps to reduce peak memory
+    temp = torch.matmul(my, in_matrix)
+    del my  # Free memory immediately
+    out_matrix = torch.matmul(temp, mx)
+    del temp, mx  # Free memory immediately
 
     lx = torch.numel(x)
     ly = torch.numel(y)
     dx = 1 if lx == 1 else (torch.squeeze(x)[-1] - torch.squeeze(x)[0]) / (lx - 1)
     dy = 1 if ly == 1 else (torch.squeeze(y)[-1] - torch.squeeze(y)[0]) / (ly - 1)
 
-    out_matrix = out_matrix * dx * dy
+    # Use in-place multiplication to save memory
+    out_matrix.mul_(dx * dy)
     return out_matrix
 
 
@@ -39,16 +47,24 @@ def midft(in_matrix, x, y, fx, fy):
     y = y.unsqueeze(-1)
     fx = fx.unsqueeze(-1)
     fy = fy.unsqueeze(-2)
+    
+    # Compute mx and my, then delete intermediate tensors to free memory
     mx = torch.exp(2 * torch.pi * 1j * torch.matmul(fx, x))
     my = torch.exp(2 * torch.pi * 1j * torch.matmul(y, fy))
-    out_matrix = torch.matmul(torch.matmul(my, in_matrix), mx)
+    
+    # Perform matrix multiplication in steps to reduce peak memory
+    temp = torch.matmul(my, in_matrix)
+    del my  # Free memory immediately
+    out_matrix = torch.matmul(temp, mx)
+    del temp, mx  # Free memory immediately
 
     lfx = torch.numel(fx)
     lfy = torch.numel(fy)
     dfx = 1 if lfx == 1 else (torch.squeeze(fx)[-1] - torch.squeeze(fx)[0]) / (lfx - 1)
     dfy = 1 if lfy == 1 else (torch.squeeze(fy)[-1] - torch.squeeze(fy)[0]) / (lfy - 1)
 
-    out_matrix = out_matrix * dfx * dfy
+    # Use in-place multiplication to save memory
+    out_matrix.mul_(dfx * dfy)
     return out_matrix
 
 
@@ -148,7 +164,11 @@ class LeastSamplingASM():
         fy = self.fy.unsqueeze(0)
 
         Fu = mdft(E0, self.xi, self.eta, fx - self.offx, fy - self.offy)
-        Eout = midft(Fu * self.H, self.x, self.y, fx, fy)
+        # Apply transfer function
+        Fu_H = Fu * self.H
+        del Fu  # Free memory immediately after use
+        Eout = midft(Fu_H, self.x, self.y, fx, fy)
+        del Fu_H  # Free memory immediately after use
 
         return Eout
 

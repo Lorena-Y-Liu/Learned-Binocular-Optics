@@ -88,6 +88,10 @@ class MixedCamera(BaseCamera):
         self.mask_upsample_factor = mask_upsample_factor
         self.modulate_phase = requires_grad
         
+        # PSF cache for validation (avoid recomputing every batch)
+        self._psf_cache = None
+        self._psf_cache_size = None
+        
         # Initialize DOE parameters (load from pretrained vectors or use analytical init)
         self._init_doe_parameters(requires_grad, use_pretrained_doe)
         
@@ -281,7 +285,12 @@ class MixedCamera(BaseCamera):
         prop = LeastSamplingASM(self, x, y, z, device)
         U2 = prop(Ein)
         self.psf_phase = torch.remainder(torch.angle(U2), 2 * torch.pi)
-        return torch.abs(U2) ** 2
+        result = torch.abs(U2) ** 2
+        
+        # Clean up to free memory
+        del prop, U2, x, y
+        
+        return result
 
     def psf_ph(self) -> torch.Tensor:
         """Get the phase of the PSF (for analysis)."""
@@ -299,7 +308,11 @@ class MixedCamera(BaseCamera):
         
         prop = LeastSamplingASM(self, x, y, z, device)
         U2 = prop(Ein)
-        return torch.abs(U2) ** 2
+        result = torch.abs(U2) ** 2
+        # Clean up intermediate tensors
+        del prop, U2, x, y
+        torch.cuda.empty_cache()
+        return result
 
     def psf_full(self, modulate_phase: bool) -> torch.Tensor:
         """Compute full PSF with or without phase modulation."""
@@ -311,6 +324,11 @@ class MixedCamera(BaseCamera):
         else:
             Ein = E0
         return F.relu(self.psf_obs_full(Ein))
+
+    def clear_psf_cache(self):
+        """Clear the cached PSF (call when DOE parameters change)."""
+        self._psf_cache = None
+        self._psf_cache_size = None
 
     def psf_at_camera(
         self,
@@ -329,6 +347,10 @@ class MixedCamera(BaseCamera):
         Returns:
             PSF tensor [C, D, H, W]
         """
+        # Use cached PSF during validation if available and size matches
+        if not is_training and self._psf_cache is not None and self._psf_cache_size == size:
+            return self._psf_cache.clone()
+        
         if not self.experiment:
             heightmap = self.height()
             device = heightmap.device
@@ -379,7 +401,14 @@ class MixedCamera(BaseCamera):
         
         # Crop to target size
         psf = transforms.CenterCrop(size)(psf)
-        return psf.squeeze(0)
+        result = psf.squeeze(0)
+        
+        # Cache PSF for validation (only when not training)
+        if not is_training:
+            self._psf_cache = result.clone().detach()
+            self._psf_cache_size = size
+        
+        return result
 
     def _blur_psf(
         self,
@@ -437,7 +466,12 @@ class MixedCamera(BaseCamera):
         
         # Compute out-of-FOV energy
         psf_out_of_fov = (psf_diffracted * mask).float()
-        return psf_out_of_fov.sum() / 10
+        result = psf_out_of_fov.sum() / 10
+        
+        # Clean up large intermediate tensors
+        del psf_diffracted, mask, X, Y, dist, outer_mask, psf_out_of_fov
+        
+        return result
 
     def forward_train(
         self,

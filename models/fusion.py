@@ -3,13 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.outputs_container import OutputsContainer
 from models.unet import UNet
-from models.feature_fusion import SCAM  # 使用下文改进后的 SCAM
+from models.feature_fusion import SCAM  # Use improved SCAM module
 
 class Recovery(nn.Module):
     def __init__(self, hparams, *args, **kargs):
         super().__init__()
         self.preinverse = hparams.preinverse
         self.scale = hparams.scale
+        
         depth_ch = 1
         color_ch = 3
         color = 3
@@ -19,7 +20,7 @@ class Recovery(nn.Module):
         preinv_input_ch = color * n_depths + color_ch
 
         base_input_layers = nn.Sequential(
-            nn.Conv2d(preinv_input_ch+color, preinv_input_ch+color, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(2*color+depth_ch, preinv_input_ch+color, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(preinv_input_ch+color),
             nn.ReLU(),
             nn.Conv2d(preinv_input_ch+color, base_ch, kernel_size=3, padding=1, bias=False),
@@ -46,15 +47,15 @@ class Recovery(nn.Module):
             nn.ReLU()
         )
         output_layers = nn.Sequential(
-            nn.Conv2d(base_ch, color, kernel_size=1, bias=True)
+            nn.Conv2d(base_ch, color+depth_ch, kernel_size=1, bias=True)
         )
         output_layers_2 = nn.Sequential(
             nn.Conv2d(base_ch, depth_ch, kernel_size=1, bias=True)
         )
-        base_ch2 = 16  # 用于深度融合分支的特征通道数
+        base_ch2 = 16  # Feature channels for depth fusion branch
 
-        # ----------------- 新增深度信息融合分支 -----------------
-        # 将 1 通道深度映射到 base_ch2 维度
+        # ----------------- Depth information fusion branch -----------------
+        # Map 1-channel depth to base_ch2 dimensions
         self.depth_feature_conv = nn.Sequential(
             nn.Conv2d(depth_ch, base_ch2, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(base_ch2),
@@ -65,9 +66,9 @@ class Recovery(nn.Module):
             nn.BatchNorm2d(base_ch2),
             nn.ReLU()
         )
-        # 使用改进后的 SCAM 模块进行特征融合
+        # Use improved SCAM module for feature fusion
         self.scam_depth = SCAM(base_ch2)
-        # 细化融合后的特征，生成最终深度图（1通道）
+        # Predict either an absolute depth (legacy) or a residual correction (recommended)
         self.depth_refine = nn.Sequential(
             nn.Conv2d(base_ch2, base_ch2, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(base_ch2),
@@ -95,6 +96,13 @@ class Recovery(nn.Module):
             nn.BatchNorm2d(base_ch2),
             nn.ReLU()
         )
+        self.refine_depth_layers = nn.Sequential(
+                    nn.Conv2d(depth_ch, base_ch2, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(base_ch2),
+                    nn.ReLU(),
+                    nn.Conv2d(base_ch2, base_ch2, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(base_ch2),
+                    nn.ReLU())
         self.decoder2 = nn.Sequential(
             UNet(
                 channels=[base_ch2, base_ch2, 2 * base_ch2, 2 * base_ch2],
@@ -124,7 +132,7 @@ class Recovery(nn.Module):
             )
         )
 
-        # 权重初始化
+        # Weight initialization
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -145,28 +153,26 @@ class Recovery(nn.Module):
                                                                     int(h_sz*self.scale),
                                                                     int(w_sz*self.scale)],
                                          mode='trilinear', align_corners=False)
-        inputs = torch.cat([captimgs_left[:, :3, ...].unsqueeze(2), pinv_volumes_left], dim=2)
-        inputs = torch.cat([inputs.reshape(b_sz, -1, int(h_sz*self.scale), int(w_sz*self.scale)), captimgs_right], dim=1)
+        #inputs = torch.cat([captimgs_left.unsqueeze(2), pinv_volumes_left], dim=2)
+        inputs = torch.cat([captimgs_left, captimgs_right, rough_depth], dim=1)
         inputs = self.input_layers(inputs)
         
-        # 得到解码器输出特征，并分别预测 RGB 图像和深度（DFD分支）
+        # Get decoder output features and predict RGB image and depth (DFD branch) separately
         est = self.decoder(inputs)
-        est_images = torch.sigmoid(self.output_layers(est))
-        est_depthmaps_dfd = torch.sigmoid(self.output_layers_2(est))
+        est_images = torch.sigmoid(self.output_layers(est))[:,:3,:,:]
+        est_depthmaps_dfd = torch.sigmoid(self.output_layers(est))[:,-1,:,:]
         
-        # ------------------- 深度信息融合 -------------------
-        # 分别将粗糙深度和 DFD 预测深度映射到特征空间
-        rough_feat = self.depth_feature_conv(rough_depth)
-        dfd_feat = self.dfd_feature_conv(est_depthmaps_dfd)
-        # 利用 SCAM 模块进行交叉注意力融合，并强化高频信息
-        fused_feat = self.scam_depth(rough_feat, dfd_feat)
-        # 细化融合特征得到最终深度图（采用 sigmoid 限定输出范围）
-        est_depthmaps = torch.sigmoid(self.depth_refine(fused_feat))
-        # -----------------------------------------------------
+        # ------------------- Depth information fusion -------------------
+        
+        #depth_feature=self.refine_depth_layers(rough_depth)
+        #est= self.est_feature(est)
+        #est_depthmaps=torch.sigmoid(self.refine(torch.cat([depth_feature, est], dim=1)))  # 融合后预测最终深度图    
 
+        
         outputs = OutputsContainer(
             est_images=est_images,
             est_dfd=est_depthmaps_dfd,
-            est_depthmaps=rough_depth
+            # IMPORTANT: return the learned/refined depth map, not the input rough depth
+            est_depthmaps=est_depthmaps_dfd
         )
         return outputs

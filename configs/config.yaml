@@ -58,11 +58,12 @@ optics:
 training:
   # Learning rates
   cnn_lr: 5e-4               # CNN network learning rate
-  depth_lr: 1e-4           # Depth estimation learning rate
+  depth_lr: 5e-5           # Depth estimation learning rate
   optics_lr: 0.5e-3              # Optics learning rate (set to 0 to disable)
   
   # Batch and data loading
-  batch_sz: 1
+  batch_sz: 1                # Training batch size
+  val_batch_sz: 4            # Validation batch size (can be larger since no gradients)
   num_workers: 8
   
   # Training settings
@@ -79,16 +80,30 @@ training:
 # -----------------------------------------------------------------------------
 loss:
   depth_loss_weight: 1.0
-  depth_1_loss_weight: 1.0
+  depth_1_loss_weight: 0.1
   image_loss_weight: 3.0
   psf_loss_weight: 0.01
   psf_size: 160
+
+# Optional: fine-tune IGEV matching network. Default false (frozen).
+train_matching: false
+
+# Optional fine-grained weights (used in deepstereo.py::__compute_loss)
+# Increase dfd_term_weight to strengthen DFD supervision.
+dfd_term_weight: 5.0
+epe_term_weight: 0.1
+disp2_term_weight: 0.5
+disp1_term_weight: 0.25
+
+# Diagnostics (set to 0 to disable)
+diag_every_n_steps: 200
+grad_diag_every_n_steps: 200
 
 # -----------------------------------------------------------------------------
 # Dataset Parameters
 # -----------------------------------------------------------------------------
 dataset:
-  image_sz: [192, 512]        # Image size [H, W]
+  image_sz: [320, 736]        # Image size [H, W]
   n_depths: 7                 # Number of depth planes
   min_depth: 0.67             # Minimum depth (meters)
   max_depth: 8.0              # Maximum depth (meters)
