@@ -61,6 +61,10 @@ class Vgg16PerceptualLoss(Metric):
         Returns:
             Combined perceptual loss value
         """
+        # Clamp inputs to valid range to prevent extreme values from causing NaN
+        input = torch.clamp(input, 0.0, 1.0)
+        target = torch.clamp(target, 0.0, 1.0)
+        
         # Normalize to ImageNet statistics
         input = (input - self.mean) / self.std
         target = (target - self.mean) / self.std
@@ -72,10 +76,13 @@ class Vgg16PerceptualLoss(Metric):
         input = F.pad(input, mode='reflect', pad=(4, 4, 4, 4))
         target = F.pad(target, mode='reflect', pad=(4, 4, 4, 4))
         
-        # Feature-based losses
+        # Feature-based losses with numerical stability
         for i, block in enumerate(self.vgg_blocks):
             input = block(input)
             target = block(target)
+            # Clamp feature activations to prevent extreme values
+            input = torch.clamp(input, -100.0, 100.0)
+            target = torch.clamp(target, -100.0, 100.0)
             loss += self.weight[i] * F.l1_loss(input[..., 4:-4, 4:-4], target[..., 4:-4, 4:-4])
         
         return loss

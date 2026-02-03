@@ -155,7 +155,10 @@ class BaseCamera(nn.Module, metaclass=abc.ABCMeta):
         Returns:
             Normalized PSF tensor
         """
-        return psfimg / psfimg.sum(dim=(-2, -1), keepdims=True)
+        # Guard against all-zero PSFs (or extreme underflow) which would create NaNs.
+        denom = psfimg.sum(dim=(-2, -1), keepdim=True)
+        denom = denom.clamp_min(1e-12)
+        return psfimg / denom
 
     def _capture_impl(
         self,
@@ -178,7 +181,10 @@ class BaseCamera(nn.Module, metaclass=abc.ABCMeta):
         Returns:
             Tuple of (captured_image, volume)
         """
-        scale = volume.max()
+        # Normalize dynamic range for FFT stability.
+        # Use a detached scale to avoid backprop through `amax` (which can create sparse/unstable gradients)
+        # and clamp to avoid division by zero (all-black inputs or fully-masked volumes).
+        scale = volume.detach().amax().clamp_min(eps)
         volume = volume / scale
         Fpsf = rfft(psf, 2)
         

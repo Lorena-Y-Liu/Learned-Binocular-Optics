@@ -56,10 +56,10 @@ optics:
 # Training Parameters
 # -----------------------------------------------------------------------------
 training:
-  # Learning rates
-  cnn_lr: 5e-4               # CNN network learning rate
-  depth_lr: 5e-5           # Depth estimation learning rate
-  optics_lr: 0.5e-3              # Optics learning rate (set to 0 to disable)
+  # Learning rates (REDUCED for NaN prevention)
+  cnn_lr: 1e-4               # CNN network learning rate (REDUCED from 2e-4)
+  depth_lr: 5e-6             # Depth estimation learning rate (REDUCED from 1e-5)
+  optics_lr: 5e-4            # Optics learning rate (REDUCED from 0.5e-3)
   
   # Batch and data loading
   batch_sz: 1                # Training batch size
@@ -70,10 +70,13 @@ training:
   max_epochs: 100
   num_steps: 200000
   augment: true               # Data augmentation
-  mixed_precision: true       # Mixed precision training
-  
+  mixed_precision: false      # DISABLED - mixed precision can cause NaN issues
+                              
   # Random seed
   seed: 666
+  
+  # Gradient clipping (critical for NaN prevention)
+  grad_clip_val: 0.5          # More aggressive clipping (was 1.0)
 
 # -----------------------------------------------------------------------------
 # Loss Function Weights
@@ -81,8 +84,8 @@ training:
 loss:
   depth_loss_weight: 1.0
   depth_1_loss_weight: 0.1
-  image_loss_weight: 3.0
-  psf_loss_weight: 0.01
+  image_loss_weight: 1.0              # REDUCED from 3.0 to prevent VGG loss explosion
+  psf_loss_weight: 0.01                # DISABLED: Set to 0 if NaN issues persist (was 0.01)
   psf_size: 160
 
 # Optional: fine-tune IGEV matching network. Default false (frozen).
@@ -90,14 +93,17 @@ train_matching: false
 
 # Optional fine-grained weights (used in deepstereo.py::__compute_loss)
 # Increase dfd_term_weight to strengthen DFD supervision.
-dfd_term_weight: 5.0
-epe_term_weight: 0.1
-disp2_term_weight: 0.5
-disp1_term_weight: 0.25
+dfd_term_weight: 1.0                  # REDUCED from 5.0 to prevent weight explosion
+epe_term_weight: 1.0
+disp2_term_weight: 0.05
+disp1_term_weight: 0.02
 
 # Diagnostics (set to 0 to disable)
 diag_every_n_steps: 200
 grad_diag_every_n_steps: 200
+
+# Enable detailed NaN diagnostics (prints which loss becomes NaN first)
+enable_nan_diagnostics: true     # Set to true to track which loss becomes NaN first
 
 # -----------------------------------------------------------------------------
 # Dataset Parameters

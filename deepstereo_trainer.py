@@ -164,13 +164,15 @@ def main(args):
     train_dataloader, val_dataloader = prepare_data(hparams=args)
 
     # Create trainer and start training
+    # Get gradient clip value from hparams if available
+    grad_clip = getattr(args, 'grad_clip_val', 0.5)
     trainer = Trainer.from_argparse_args(
         args,
         logger=logger,
         callbacks=[logmanager_callback],
         checkpoint_callback=checkpoint_callback,
-        # Guard against exploding gradients / NaNs
-        gradient_clip_val=1.0,
+        # Guard against exploding gradients / NaNs - use more aggressive clipping
+        gradient_clip_val=grad_clip,
         sync_batchnorm=True,
         benchmark=True,
         val_check_interval=0.5

@@ -27,8 +27,9 @@ License: MIT
 
 import copy
 import os
+import math
 from argparse import ArgumentParser, Namespace
-from collections import namedtuple
+from collections import namedtuple, deque
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import torch
@@ -105,6 +106,17 @@ class Stereo3D(pl.LightningModule):
 
         # Numerical stability / diagnosis constants
         self._norm_eps = 1e-6
+
+        # Optional: freeze optics when PSF loss is stable
+        self._optics_frozen = False
+        window = int(getattr(self.hparams, 'psf_stable_window', 20))
+        self._psf_loss_history = deque(maxlen=max(5, window))
+        self._psf_stable_hits = 0
+        self._psf_loss_computed_this_step = False
+        
+        # NaN batch tracking
+        self._nan_batch_count = 0
+        self._max_consecutive_nan = 5  # Warn when consecutive NaN exceeds this count
         
         # Perceptual loss metrics for image quality evaluation
         self.metrics = {
@@ -136,18 +148,66 @@ class Stereo3D(pl.LightningModule):
     # learning rate warm-up
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx, optimizer_closure=None, on_tpu=False,
                        using_native_amp=False, using_lbfgs=False):
-        
+
+        # Ensure the closure runs (Lightning uses it to run forward/backward in some configs)
+        # NOTE: some training steps may intentionally "skip" and return None; handle that gracefully.
+        closure_result = None
+        if optimizer_closure is not None:
+            closure_result = optimizer_closure()
+        if closure_result is None:
+            # Nothing to optimize for this batch (e.g., NaN/Inf batch skipped)
+            try:
+                optimizer.zero_grad(set_to_none=True)
+            except TypeError:
+                optimizer.zero_grad()
+            return
+
         # warm up lr
         if self.trainer.global_step < 4000:
-            lr_scale = min(1., float(self.trainer.global_step + 1) / 4000.)
-            lr_scale_optics = lr_scale = min(1., float(self.trainer.global_step + 1) / 400.)
+            lr_scale = min(1.0, float(self.trainer.global_step + 1) / 4000.0)
+            lr_scale_optics = min(1.0, float(self.trainer.global_step + 1) / 400.0)
+            # param_groups: [left_optics, right_optics, decoder, matching]
             optimizer.param_groups[0]['lr'] = lr_scale_optics * float(self.hparams.optics_lr)
             optimizer.param_groups[1]['lr'] = lr_scale_optics * float(self.hparams.optics_lr)
             optimizer.param_groups[2]['lr'] = lr_scale * float(self.hparams.cnn_lr)
             optimizer.param_groups[3]['lr'] = lr_scale * float(self.hparams.depth_lr)
+
+        # If optics are frozen, keep their learning rates at 0
+        # param_groups: [left_optics, right_optics, decoder, matching]
+        if getattr(self, '_optics_frozen', False) and len(optimizer.param_groups) >= 2:
+            optimizer.param_groups[0]['lr'] = 0.0
+            optimizer.param_groups[1]['lr'] = 0.0
+
+        # Detect non-finite gradients before stepping to prevent permanently corrupting weights.
+        # Late-training NaNs often come from a single bad step.
+        has_nonfinite_grad = False
+        for group in optimizer.param_groups:
+            for p in group.get('params', []):
+                if p.grad is None:
+                    continue
+                if not torch.isfinite(p.grad).all():
+                    has_nonfinite_grad = True
+                    break
+            if has_nonfinite_grad:
+                break
+
+        if has_nonfinite_grad:
+            if self.trainer.global_step % 10 == 0:
+                print(f"⚠️ Non-finite gradients detected at step {self.trainer.global_step}. Skipping optimizer step.")
+            optimizer.zero_grad(set_to_none=True)
+            return
+
+        # Gradient clipping (do it here to be robust even if Trainer-side clipping is bypassed by custom optimizer_step)
+        clip_val = float(getattr(self.hparams, 'grad_clip_val', 1.0))
+        if clip_val > 0:
+            params = [p for p in self.parameters() if p.grad is not None]
+            if len(params) > 0:
+                # Compute gradient norm before clipping for diagnostics
+                total_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=clip_val)
+                
         # update params
         optimizer.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
     def configure_optimizers(self):
         params = [
@@ -158,6 +218,27 @@ class Stereo3D(pl.LightningModule):
         ]
         optimizer = torch.optim.Adam(params)
         return optimizer
+
+    def _skip_batch_loss(self, reason: str, batch_idx: int) -> torch.Tensor:
+        """Return None to safely skip a batch when NaN/Inf is detected.
+
+        Returning None tells PyTorch Lightning to skip the optimization step entirely,
+        avoiding issues with gradient clipping when no gradients are available.
+        
+        Note: Returning a dummy tensor with requires_grad=True causes issues in older
+        Lightning versions because gradient clipping fails when there are no parameters
+        with gradients (IndexError: list index out of range).
+        """
+        self._nan_batch_count = getattr(self, '_nan_batch_count', 0) + 1
+        # Print occasionally to avoid flooding logs on persistent instability
+        if self._nan_batch_count <= 5 or (self._nan_batch_count % 50 == 0):
+            print(
+                f"⚠️ Skipping batch at Step {self.global_step} (Batch {batch_idx}). "
+                f"Reason: {reason}. Total skipped: {self._nan_batch_count}"
+            )
+
+        # Return None to skip this batch entirely (no backward, no optimizer step)
+        return None
     
     def training_step(self, samples, batch_idx):
 
@@ -167,6 +248,29 @@ class Stereo3D(pl.LightningModule):
             self.matching.train()
         else:
             self.matching.eval()
+        
+        # ========== Input Data NaN Check ==========
+        # Check if input data contains NaN, skip this batch if so
+        input_tensors_to_check = [
+            ('left_image', samples['left_image']),
+            ('right_image', samples['right_image']),
+            ('depthmap', samples['unnorm_depthmap']),
+            ('depthmap_2', samples['unnorm_depthmap_2']),
+        ]
+        
+        for name, tensor in input_tensors_to_check:
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                print(f"\n{'='*80}")
+                print(f"🔴 Input Data Anomaly Detected [Step {self.global_step}, Batch {batch_idx}]")
+                print(f"{'='*80}")
+                print(f"Detected input '{name}' contains NaN/INF!")
+                print(f"  Shape: {tensor.shape}")
+                print(f"  NaN count: {torch.isnan(tensor).sum().item()}")
+                print(f"  INF count: {torch.isinf(tensor).sum().item()}")
+                print(f"  Skipping this batch and continuing training...")
+                print(f"{'='*80}\n")
+                return self._skip_batch_loss(reason=f"input {name} has NaN/Inf", batch_idx=batch_idx)
+        
         target_images_left = samples['left_image']
         target_images_right = samples['right_image']
 
@@ -189,13 +293,47 @@ class Stereo3D(pl.LightningModule):
                     target_depthmaps,  target_depthmaps_m, target_norm_depthmaps, target_norm_depthmaps_m,
                     original_depthmaps, original_depthmaps_m ,disparity, disparity_2]
         outputs = self.forward(*input_args, is_training=True)
+        
+        # ========== Model Output NaN Detection ==========
+        # Skip this batch if model output contains NaN
+        outputs_to_check = [
+            ('est_images_left', outputs.est_images_left),
+            ('est_depthmaps', outputs.est_depthmaps),
+        ]
+        for name, tensor in outputs_to_check:
+            if tensor is not None and (torch.isnan(tensor).any() or torch.isinf(tensor).any()):
+                nan_count = torch.isnan(tensor).sum().item()
+                inf_count = torch.isinf(tensor).sum().item()
+                print(f"\n{'='*80}")
+                print(f"🔴 Model Output NaN Detected [Step {self.global_step}, Batch {batch_idx}]")
+                print(f"{'='*80}")
+                print(f"Detected output '{name}' contains NaN/INF!")
+                print(f"  Shape: {tensor.shape}")
+                print(f"  NaN count: {nan_count}")
+                print(f"  INF count: {inf_count}")
+                print(f"  Valid value range: [{tensor[torch.isfinite(tensor)].min().item() if torch.isfinite(tensor).any() else 'N/A'}, "
+                      f"{tensor[torch.isfinite(tensor)].max().item() if torch.isfinite(tensor).any() else 'N/A'}]")
+                print(f"  Skipping this batch and continuing training...")
+                print(f"{'='*80}\n")
+                return self._skip_batch_loss(reason=f"output {name} has NaN/Inf", batch_idx=batch_idx)
+        
         target_images_left = outputs.target_images_left
         target_images_right = outputs.target_images_right
         
         target_depthmaps = outputs.target_depthmaps
         target_depthmaps_m = outputs.target_depthmaps_m
 
-        data_loss, loss_logs = self.__compute_loss(outputs, is_training=True)
+        loss_result = self.__compute_loss(outputs, is_training=True)
+        
+        # If __compute_loss returns None, it means this batch should be skipped (NaN detected)
+        if loss_result is None:
+            return self._skip_batch_loss(reason="__compute_loss returned None (NaN/Inf detected)", batch_idx=batch_idx)
+        
+        data_loss, loss_logs = loss_result
+
+        # Optional: freeze optics updates once PSF loss is stable
+        self._maybe_freeze_optics_from_psf(loss_logs)
+
         train_logs = {f'train_loss/{key}': val for key, val in loss_logs.items()}
 
 
@@ -217,6 +355,70 @@ class Stereo3D(pl.LightningModule):
             torch.cuda.empty_cache()
 
         return data_loss
+
+    def _maybe_freeze_optics_from_psf(self, loss_logs: dict) -> None:
+        """Freeze optics parameters once PSF loss becomes stable.
+
+        Enabled by setting `freeze_optics_when_psf_stable: true`.
+        Stability is checked only on steps where PSF loss was actually computed.
+        """
+        if not getattr(self.hparams, 'freeze_optics_when_psf_stable', False):
+            return
+        if not getattr(self.hparams, 'optimize_optics', False):
+            return
+        if getattr(self, '_optics_frozen', False):
+            return
+        if not bool(getattr(self, '_psf_loss_computed_this_step', False)):
+            return
+
+        psf_left = loss_logs.get('psf_loss_left', None)
+        psf_right = loss_logs.get('psf_loss_right', None)
+        if psf_left is None or psf_right is None:
+            return
+
+        psf_total = psf_left.detach() + psf_right.detach()
+        if not torch.isfinite(psf_total):
+            return
+        psf_val = float(psf_total.item())
+        self._psf_loss_history.append(psf_val)
+
+        min_steps = int(getattr(self.hparams, 'psf_stable_min_steps', 20000))
+        if int(self.global_step) < min_steps:
+            return
+
+        window = int(getattr(self.hparams, 'psf_stable_window', 20))
+        if len(self._psf_loss_history) < max(5, window):
+            return
+
+        hist = list(self._psf_loss_history)[-window:]
+        mean = sum(hist) / len(hist)
+        var = sum((x - mean) ** 2 for x in hist) / max(1, (len(hist) - 1))
+        std = var ** 0.5
+
+        abs_tol = float(getattr(self.hparams, 'psf_stable_abs_tol', 1e-4))
+        rel_tol = float(getattr(self.hparams, 'psf_stable_rel_tol', 2e-2))
+        stable = (std < abs_tol) or (abs(mean) > 0 and (std / abs(mean)) < rel_tol)
+
+        patience = int(getattr(self.hparams, 'psf_stable_patience', 3))
+        self._psf_stable_hits = (self._psf_stable_hits + 1) if stable else 0
+        if self._psf_stable_hits < patience:
+            return
+
+        # Freeze optics parameters
+        self._optics_frozen = True
+        try:
+            self.camera_left.requires_grad_(False)
+            self.camera_right.requires_grad_(False)
+        except Exception:
+            pass
+
+        print(
+            f"✅ Freezing optics at step {self.global_step} (PSF stable: mean={mean:.6g}, std={std:.6g}, window={window})."
+        )
+
+        # Optional: stop computing PSF loss after freezing (saves compute)
+        if not getattr(self.hparams, 'psf_monitor_after_freeze', True):
+            self.hparams.optimize_optics = False
 
     def on_after_backward(self):
         """Optional grad-norm diagnostics for key decoder heads.
@@ -325,6 +527,11 @@ class Stereo3D(pl.LightningModule):
             torch.cuda.empty_cache()
         
         with torch.no_grad():
+            # Check if validation input data contains NaN
+            if torch.isnan(samples['left_image']).any() or torch.isnan(samples['unnorm_depthmap']).any():
+                print(f"⚠️ WARNING: Validation batch {batch_idx} contains NaN in input, skipping...")
+                return None
+            
             # Extract all needed data from samples immediately
             target_images_left = samples['left_image']
             target_images_right = samples['right_image']
@@ -420,7 +627,14 @@ class Stereo3D(pl.LightningModule):
             # Compute val_loss
             # NOTE: __compute_loss uses valid masks. On some validation batches valid can be empty,
             # which makes .mean() return NaN. If that happens, treat this batch as skipped for val_loss.
-            val_loss, val_logs = self.__compute_loss(outputs, is_training=False)
+            loss_result = self.__compute_loss(outputs, is_training=False)
+            
+            # If __compute_loss returns None, it means this batch should be skipped (NaN detected)
+            if loss_result is None:
+                self.log('validation/val_loss_nan_batches', 1.0, on_step=False, on_epoch=True)
+                return None
+            
+            val_loss, val_logs = loss_result
             
             if not torch.isfinite(val_loss):
                 # Avoid poisoning epoch-level val_loss aggregation with NaNs
@@ -597,8 +811,18 @@ class Stereo3D(pl.LightningModule):
         
         input_rough=est/float(self.hparams.max_disp)
         input_rough_m=est_m/float(self.hparams.max_disp)
-        input_rough=(input_rough-norm_min.reshape(-1,1,1,1))/(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1)+1e-8)
-        input_rough_m=(input_rough_m-norm_min_m.reshape(-1,1,1,1))/(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1)+1e-8)
+        # Use larger epsilon for numerical stability
+        norm_eps = 1e-6
+        norm_range = norm_max.reshape(-1,1,1,1) - norm_min.reshape(-1,1,1,1)
+        norm_range_m = norm_max_m.reshape(-1,1,1,1) - norm_min_m.reshape(-1,1,1,1)
+        # Clamp range to avoid division by very small numbers
+        norm_range = torch.clamp(norm_range, min=norm_eps)
+        norm_range_m = torch.clamp(norm_range_m, min=norm_eps)
+        input_rough = (input_rough - norm_min.reshape(-1,1,1,1)) / norm_range
+        input_rough_m = (input_rough_m - norm_min_m.reshape(-1,1,1,1)) / norm_range_m
+        # Clamp normalized inputs to valid range [0, 1] to prevent extreme values
+        input_rough = torch.clamp(input_rough, 0.0, 1.0)
+        input_rough_m = torch.clamp(input_rough_m, 0.0, 1.0)
         
         if hparams.warp_img:
             # Use pre-initialized warping object
@@ -643,9 +867,13 @@ class Stereo3D(pl.LightningModule):
                                         rough_depth=input_rough_m.float(), hparams=hparams)
         
         left = Outputs[0]
+        # Clamp decoder outputs to valid range to prevent NaN propagation
+        left = torch.clamp(left, 0.0, 1.0)
         est_dfd = Outputs[1]
+        est_dfd = torch.clamp(est_dfd, 0.0, 1.0)  # Clamp before denormalization
         est_dfd = est_dfd*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
         est_depthmaps = Outputs[2]
+        est_depthmaps = torch.clamp(est_depthmaps, 0.0, 1.0)  # Clamp before denormalization
         est_depthmaps = est_depthmaps*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
         #est_dfd=est_dfd*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
         #est_depthmaps=est_depthmaps*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
@@ -653,9 +881,13 @@ class Stereo3D(pl.LightningModule):
         
 
         left_m = Outputs_m[0]
+        # Clamp mirror decoder outputs to valid range
+        left_m = torch.clamp(left_m, 0.0, 1.0)
         est_dfd_m = Outputs_m[1]
+        est_dfd_m = torch.clamp(est_dfd_m, 0.0, 1.0)  # Clamp before denormalization
         est_dfd_m = est_dfd_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
         est_depthmaps_m = Outputs_m[2]
+        est_depthmaps_m = torch.clamp(est_depthmaps_m, 0.0, 1.0)  # Clamp before denormalization
         est_depthmaps_m = est_depthmaps_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
         #est_dfd_m=est_dfd_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
         ##est_depthmaps_m=est_depthmaps_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
@@ -836,6 +1068,9 @@ class Stereo3D(pl.LightningModule):
     def __compute_loss(self, outputs, is_training=True):
         
         hparams = self.hparams
+
+        # Track whether PSF loss was computed on this step (used for optics-freeze logic)
+        self._psf_loss_computed_this_step = False
         target_depthmaps=outputs.target_depthmaps
         target_images_left=outputs.target_images_left
         target_depthmaps_m=outputs.target_depthmaps_m
@@ -853,6 +1088,18 @@ class Stereo3D(pl.LightningModule):
         est_depthmaps_m = outputs.est_depthmaps_m
         est_dfd_m=outputs.est_dfd_m
         target_roughdepth_m= outputs.target_roughdepth_m
+        
+        # ===== Early NaN Detection: If critical output is NaN, return None to skip the entire batch =====
+        critical_outputs = [
+            ('est_images_left', est_images_left),
+            ('est_images_left_m', est_images_left_m),
+            ('est_depthmaps', est_depthmaps),
+            ('est_depthmaps_m', est_depthmaps_m),
+        ]
+        for name, tensor in critical_outputs:
+            if tensor is not None and (torch.isnan(tensor).any() or torch.isinf(tensor).any()):
+                print(f"🛑 NaN/Inf detected in {name} at Step {self.global_step}. Skipping batch.")
+                return None  # Signal to training_step to skip this batch
 
         # NOTE: some helper metrics may return CPU tensors. Keep scalars device-safe
         # because Lightning stacks logged values at epoch end.
@@ -862,8 +1109,22 @@ class Stereo3D(pl.LightningModule):
             psnr_left = psnr_left.to(est_images_left.device)
         if isinstance(ssmi_left, torch.Tensor) and ssmi_left.device != est_images_left.device:
             ssmi_left = ssmi_left.to(est_images_left.device)
-        left_image_loss = self.image_lossfn.train_loss(est_images_left, target_images_left)
-        left_image_loss_m = self.image_lossfn.train_loss(est_images_left_m, target_images_left_m)
+        
+        # Clamp estimated images to valid range [0, 1] to prevent VGG loss from exploding
+        est_images_left_safe = torch.clamp(est_images_left, 0, 1)
+        est_images_left_m_safe = torch.clamp(est_images_left_m, 0, 1)
+        
+        left_image_loss = self.image_lossfn.train_loss(est_images_left_safe, target_images_left)
+        left_image_loss_m = self.image_lossfn.train_loss(est_images_left_m_safe, target_images_left_m)
+        
+        # Safety check for image loss NaN - If NaN detected, return None to skip this batch
+        if torch.isnan(left_image_loss) or torch.isinf(left_image_loss):
+            print(f"🛑 NaN in left_image_loss at Step {self.global_step}. Skipping batch.")
+            return None
+        
+        if torch.isnan(left_image_loss_m) or torch.isinf(left_image_loss_m):
+            print(f"🛑 NaN in left_image_loss_m at Step {self.global_step}. Skipping batch.")
+            return None
         
         valid = ((target_roughdepth >= 0.5) & (target_roughdepth < hparams.max_disp))
         valid_m = ((target_roughdepth_m >= 0.5) & (target_roughdepth_m < hparams.max_disp))
@@ -931,8 +1192,24 @@ class Stereo3D(pl.LightningModule):
         depth_loss_m = mae(est_depthmaps_m, target_depthmaps_m)
         depth_loss_total = (depth_loss + depth_loss_m) / 2
         px_3=calculate_3px(255*est_depthmaps,255*target_depthmaps)
-        epe_loss = mae(255*est_depthmaps,255*target_depthmaps)
-        epe_loss_m = mae(255*est_depthmaps_m,255*target_depthmaps_m)
+        
+        # Clamp depth maps to valid range to prevent overflow when multiplying by 255
+        est_depthmaps_safe = torch.clamp(est_depthmaps, 0, 1)
+        est_depthmaps_m_safe = torch.clamp(est_depthmaps_m, 0, 1)
+        target_depthmaps_safe = torch.clamp(target_depthmaps, 0, 1)
+        target_depthmaps_m_safe = torch.clamp(target_depthmaps_m, 0, 1)
+        
+        epe_loss = mae(255*est_depthmaps_safe, 255*target_depthmaps_safe)
+        epe_loss_m = mae(255*est_depthmaps_m_safe, 255*target_depthmaps_m_safe)
+        
+        # Safety check for EPE loss - If NaN, skip batch
+        if torch.isnan(epe_loss) or torch.isinf(epe_loss):
+            print(f"🛑 NaN in epe_loss at Step {self.global_step}. Skipping batch.")
+            return None
+        
+        if torch.isnan(epe_loss_m) or torch.isinf(epe_loss_m):
+            print(f"🛑 NaN in epe_loss_m at Step {self.global_step}. Skipping batch.")
+            return None
         
         # Only compute PSF loss during training to save memory in validation
         # PSF doesn't change per batch, so computing it every validation batch is wasteful
@@ -940,13 +1217,25 @@ class Stereo3D(pl.LightningModule):
         compute_psf = is_training and hparams.optimize_optics
         if compute_psf:
             # Only compute PSF loss every N steps to reduce memory usage
-            psf_freq = int(getattr(hparams, 'psf_loss_freq', 1))
+            psf_freq = int(getattr(hparams, 'psf_loss_freq', 5))
             if self.global_step % psf_freq == 0:
+                self._psf_loss_computed_this_step = True
                 psf_left_out_of_fov_sum = self.camera_left.psf_out_of_fov_energy(hparams.psf_size)
                 psf_left_loss = psf_left_out_of_fov_sum
 
                 psf_right_out_of_fov_sum = self.camera_right.psf_out_of_fov_energy(hparams.psf_size)
                 psf_right_loss = psf_right_out_of_fov_sum
+                
+                # Safety check for PSF loss NaN (critical since optical optimization can diverge)
+                if torch.isnan(psf_left_loss) or torch.isinf(psf_left_loss):
+                    print(f"⚠️ WARNING [Step {self.global_step}]: psf_left_loss = {psf_left_loss}. "
+                          f"Disabling PSF loss for stability.")
+                    psf_left_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                
+                if torch.isnan(psf_right_loss) or torch.isinf(psf_right_loss):
+                    print(f"⚠️ WARNING [Step {self.global_step}]: psf_right_loss = {psf_right_loss}. "
+                          f"Disabling PSF loss for stability.")
+                    psf_right_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
             else:
                 # Skip PSF computation for this step
                 psf_left_loss = torch.zeros((), device=self.device)
@@ -970,6 +1259,18 @@ class Stereo3D(pl.LightningModule):
         
         depth_term = epe_term_weight * (depth_loss + depth_loss_m) + dfd_term_weight * (dfd_loss + dfd_loss_m)
         disp_term = disp2_term_weight * (depth_2_loss + depth_2_loss_m) + disp1_term_weight * (depth_1_loss + depth_1_loss_m)
+        # Safety check for NaN in intermediate terms - Return None to skip batch
+        if torch.isnan(depth_term) or torch.isinf(depth_term):
+            print(f"🛑 NaN in depth_term at Step {self.global_step}. Skipping batch.")
+            return None
+        
+        if torch.isnan(disp_term) or torch.isinf(disp_term):
+            print(f"🛑 NaN in disp_term at Step {self.global_step}. Skipping batch.")
+            return None
+        
+        if torch.isnan(total_image_loss) or torch.isinf(total_image_loss):
+            print(f"🛑 NaN in total_image_loss at Step {self.global_step}. Skipping batch.")
+            return None
 
         total_loss = self.__combine_loss(
             depth_term,
@@ -977,6 +1278,52 @@ class Stereo3D(pl.LightningModule):
             total_image_loss,
             psf_left_loss + psf_right_loss
         )
+        
+        # Final NaN check on total loss - Return None to skip batch
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"🛑 NaN in total_loss at Step {self.global_step}. Skipping batch.")
+            return None
+        
+        # ========== NaN Detailed Diagnostics (Optional) ==========
+        # To track which loss becomes NaN first, enable via config
+        if getattr(hparams, 'enable_nan_diagnostics', False):
+            nan_diagnostic = {
+                'step': self.global_step,
+                'dfd_loss': dfd_loss.item(),
+                'dfd_loss_m': dfd_loss_m.item(),
+                'depth_loss': depth_loss.item(),
+                'depth_loss_m': depth_loss_m.item(),
+                'epe_loss': epe_loss.item(),
+                'epe_loss_m': epe_loss_m.item(),
+                'depth_2_loss': depth_2_loss.item(),
+                'depth_2_loss_m': depth_2_loss_m.item(),
+                'depth_1_loss': depth_1_loss.item(),
+                'depth_1_loss_m': depth_1_loss_m.item(),
+                'left_image_loss': left_image_loss.item(),
+                'left_image_loss_m': left_image_loss_m.item(),
+                'psf_left_loss': psf_left_loss.item(),
+                'psf_right_loss': psf_right_loss.item(),
+                'depth_term': depth_term.item(),
+                'disp_term': disp_term.item(),
+                'total_image_loss': total_image_loss.item(),
+                'total_loss': total_loss.item(),
+            }
+            
+            # Check if each loss is NaN
+            nan_losses = []
+            for name, value in nan_diagnostic.items():
+                if name != 'step' and (math.isnan(value) or math.isinf(value)):
+                    nan_losses.append(f"{name}={value}")
+            
+            if nan_losses:
+                print(f"\n{'='*80}")
+                print(f"🔴 NaN Detection [Step {self.global_step}]")
+                print(f"{'='*80}")
+                print(f"Found {len(nan_losses)} NaN/INF loss terms:")
+                for loss_str in nan_losses:
+                    print(f"  ❌ {loss_str}")
+                print(f"{'='*80}\n")
+        
         logs = {
             'total_loss': total_loss,
             # expose more supervision-related scalars for TensorBoard
@@ -1091,9 +1438,6 @@ class Stereo3D(pl.LightningModule):
             
             self.logger.experiment.add_image('optics/phasemap_left_G', phasemap_left_1, self.global_step)
             psf_left= psf_left.flip(1)
-            grid_psf_left = torchvision.utils.make_grid(psf_left.transpose(0, 1),
-                                                   nrow=9, pad_value=1, normalize=False)
-            self.logger.experiment.add_image('optics/psf_left', grid_psf_left, self.global_step)
             
             psf_left /= psf_left.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0].max(dim=0, keepdim=True)[0]
             

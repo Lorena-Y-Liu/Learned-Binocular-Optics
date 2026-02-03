@@ -55,6 +55,9 @@ class TrainingConfig:
     
     # Random seed
     seed: int = 666
+    
+    # Gradient clipping
+    grad_clip_val: float = 0.5  # Gradient clipping value for NaN prevention
 
 
 @dataclass

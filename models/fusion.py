@@ -166,7 +166,7 @@ class Recovery(nn.Module):
         
         #depth_feature=self.refine_depth_layers(rough_depth)
         #est= self.est_feature(est)
-        #est_depthmaps=torch.sigmoid(self.refine(torch.cat([depth_feature, est], dim=1)))  # 融合后预测最终深度图    
+        #est_depthmaps=torch.sigmoid(self.refine(torch.cat([depth_feature, est], dim=1)))  # Predict final depth map after fusion    
 
         
         outputs = OutputsContainer(
