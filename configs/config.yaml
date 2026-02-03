@@ -57,9 +57,9 @@ optics:
 # -----------------------------------------------------------------------------
 training:
   # Learning rates (REDUCED for NaN prevention)
-  cnn_lr: 1e-4               # CNN network learning rate (REDUCED from 2e-4)
-  depth_lr: 5e-6             # Depth estimation learning rate (REDUCED from 1e-5)
-  optics_lr: 5e-4            # Optics learning rate (REDUCED from 0.5e-3)
+  cnn_lr: 1e-4               # CNN network learning rate 
+  depth_lr: 5e-6             # Depth estimation learning rate 
+  optics_lr: 5e-4            # Optics learning rate 
   
   # Batch and data loading
   batch_sz: 1                # Training batch size
@@ -70,7 +70,7 @@ training:
   max_epochs: 100
   num_steps: 200000
   augment: true               # Data augmentation
-  mixed_precision: false      # DISABLED - mixed precision can cause NaN issues
+  mixed_precision: false      
                               
   # Random seed
   seed: 666
@@ -84,16 +84,16 @@ training:
 loss:
   depth_loss_weight: 1.0
   depth_1_loss_weight: 0.1
-  image_loss_weight: 1.0              # REDUCED from 3.0 to prevent VGG loss explosion
-  psf_loss_weight: 0.01                # DISABLED: Set to 0 if NaN issues persist (was 0.01)
+  image_loss_weight: 1.0              
+  psf_loss_weight: 0.01               
   psf_size: 160
 
-# Optional: fine-tune IGEV matching network. Default false (frozen).
+# Optional: fine-tune IGEV matching network. 
 train_matching: false
 
 # Optional fine-grained weights (used in deepstereo.py::__compute_loss)
 # Increase dfd_term_weight to strengthen DFD supervision.
-dfd_term_weight: 1.0                  # REDUCED from 5.0 to prevent weight explosion
+dfd_term_weight: 1.0                  
 epe_term_weight: 1.0
 disp2_term_weight: 0.05
 disp1_term_weight: 0.02
@@ -103,7 +103,7 @@ diag_every_n_steps: 200
 grad_diag_every_n_steps: 200
 
 # Enable detailed NaN diagnostics (prints which loss becomes NaN first)
-enable_nan_diagnostics: true     # Set to true to track which loss becomes NaN first
+enable_nan_diagnostics: true     
 
 # -----------------------------------------------------------------------------
 # Dataset Parameters
