@@ -96,8 +96,10 @@ class Recovery2(nn.Module):
             # No activation here - we'll handle it in forward
         )
         
-        # Scale factor for residual (learnable, controls how much correction to apply)
-        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+        # Scale factor for residual (FIXED, not learnable, to prevent scale drift)
+        # Using a fixed value ensures the network cannot grow the residual magnitude
+        # unboundedly during training, which was causing global scale shift.
+        self.max_residual = 0.1
         
         # Optional: Additional depth refinement branch using SCAM
         base_ch2 = 16
@@ -201,8 +203,13 @@ class Recovery2(nn.Module):
         # [Improvement 2 & 3] Depth prediction with residual learning
         # Predict a residual/correction to the rough depth
         depth_residual = self.output_layers_depth(decoded_features)
-        # Use tanh to bound residual, then scale
-        depth_residual = torch.tanh(depth_residual) * self.residual_scale
+        # Use tanh to bound residual, then scale with FIXED max_residual
+        depth_residual = torch.tanh(depth_residual) * self.max_residual
+        # [KEY FIX] Zero-mean constraint: subtract spatial mean so the residual
+        # can only add high-frequency details (edges, texture) without shifting
+        # the global depth level. This preserves rough_depth's good global scale
+        # while allowing local refinement.
+        depth_residual = depth_residual - depth_residual.mean(dim=[2, 3], keepdim=True)
         # Add residual to rough depth, clamp to valid range [0, 1]
         est_depthmaps_dfd = (rough_depth + depth_residual).clamp(0.0, 1.0)
         
@@ -216,7 +223,9 @@ class Recovery2(nn.Module):
             fused_features = self.scam_depth(rough_features, dfd_features)
             
             # Predict final refined depth (also as residual)
-            refine_residual = torch.tanh(self.depth_refine(fused_features)) * 0.1
+            refine_residual = torch.tanh(self.depth_refine(fused_features)) * 0.05
+            # [KEY FIX] Zero-mean constraint on refinement residual too
+            refine_residual = refine_residual - refine_residual.mean(dim=[2, 3], keepdim=True)
             est_depthmaps_refined = (est_depthmaps_dfd + refine_residual).clamp(0.0, 1.0)
         else:
             est_depthmaps_refined = est_depthmaps_dfd
@@ -280,7 +289,8 @@ class Recovery2Light(nn.Module):
             nn.Conv2d(base_ch // 2, depth_ch, kernel_size=1, bias=True),
         )
         
-        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+        # Fixed residual scale (not learnable) to prevent scale drift
+        self.max_residual = 0.1
         self._init_weights()
 
     def _init_weights(self):
@@ -310,8 +320,10 @@ class Recovery2Light(nn.Module):
         # Separate predictions
         est_images = torch.sigmoid(self.output_layers_rgb(decoded_features))
         
-        # Residual depth prediction
-        depth_residual = torch.tanh(self.output_layers_depth(decoded_features)) * self.residual_scale
+        # Residual depth prediction with zero-mean constraint
+        depth_residual = torch.tanh(self.output_layers_depth(decoded_features)) * self.max_residual
+        # Zero-mean: preserve rough_depth's global scale, only add details
+        depth_residual = depth_residual - depth_residual.mean(dim=[2, 3], keepdim=True)
         est_depthmaps_dfd = (rough_depth + depth_residual).clamp(0.0, 1.0)
         
         # [Improvement 2] Return actual DFD prediction
