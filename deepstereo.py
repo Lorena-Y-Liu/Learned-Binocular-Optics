@@ -809,17 +809,11 @@ class Stereo3D(pl.LightningModule):
             norm_max[i], norm_min[i]=depthmaps[i,...].max(),depthmaps[i,...].min()
             norm_max_m[i], norm_min_m[i] = depthmaps_m[i,...].max(), depthmaps_m[i,...].min()
         
+        # Keep rough disparity in normalized [0, 1] scale for decoder supervision consistency.
+        # Do NOT re-normalize with per-sample GT min/max (that mixes target statistics into inputs
+        # and creates scale mismatch with target_disp_norm).
         input_rough=est/float(self.hparams.max_disp)
         input_rough_m=est_m/float(self.hparams.max_disp)
-        # Use larger epsilon for numerical stability
-        norm_eps = 1e-6
-        norm_range = norm_max.reshape(-1,1,1,1) - norm_min.reshape(-1,1,1,1)
-        norm_range_m = norm_max_m.reshape(-1,1,1,1) - norm_min_m.reshape(-1,1,1,1)
-        # Clamp range to avoid division by very small numbers
-        norm_range = torch.clamp(norm_range, min=norm_eps)
-        norm_range_m = torch.clamp(norm_range_m, min=norm_eps)
-        input_rough = (input_rough - norm_min.reshape(-1,1,1,1)) / norm_range
-        input_rough_m = (input_rough_m - norm_min_m.reshape(-1,1,1,1)) / norm_range_m
         # Clamp normalized inputs to valid range [0, 1] to prevent extreme values
         input_rough = torch.clamp(input_rough, 0.0, 1.0)
         input_rough_m = torch.clamp(input_rough_m, 0.0, 1.0)
