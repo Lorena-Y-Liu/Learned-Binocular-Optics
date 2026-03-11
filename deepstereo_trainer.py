@@ -41,7 +41,7 @@ except ImportError:
 seed_everything(123)
 
 # GPU configuration
-GPU_ID = '1'
+GPU_ID = '2'
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
 
 # Configure PyTorch CUDA memory allocator to reduce fragmentation
@@ -143,6 +143,13 @@ def main(args):
         else:
             pass  # Config file not found, using command-line args
     
+    # Check for checkpoint path from config
+    checkpoint_path = getattr(args, 'checkpoint_path', None)
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Found checkpoint path in config: {checkpoint_path}")
+    else:
+        checkpoint_path = None
+    
     # Setup logger and callbacks
     logger = TensorBoardLogger(args.default_root_dir, name=args.experiment_name)
     logmanager_callback = LogManager()
@@ -166,6 +173,10 @@ def main(args):
     # Create trainer and start training
     # Get gradient clip value from hparams if available
     grad_clip = getattr(args, 'grad_clip_val', 0.5)
+    extra_trainer_kwargs = {}
+    if checkpoint_path:
+        extra_trainer_kwargs['resume_from_checkpoint'] = checkpoint_path
+        print(f"Will resume training from checkpoint: {checkpoint_path}")
     trainer = Trainer.from_argparse_args(
         args,
         logger=logger,
@@ -175,8 +186,10 @@ def main(args):
         gradient_clip_val=grad_clip,
         sync_batchnorm=True,
         benchmark=True,
-        val_check_interval=0.5
+        val_check_interval=0.5,
+        **extra_trainer_kwargs,
     )
+    
     trainer.fit(model, train_dataloader=train_dataloader, val_dataloaders=val_dataloader)
 
 
