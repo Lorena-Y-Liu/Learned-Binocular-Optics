@@ -864,11 +864,10 @@ class Stereo3D(pl.LightningModule):
         # Clamp decoder outputs to valid range to prevent NaN propagation
         left = torch.clamp(left, 0.0, 1.0)
         est_dfd = Outputs[1]
-        est_dfd = torch.clamp(est_dfd, 0.0, 1.0)  # Clamp before denormalization
-        est_dfd = est_dfd*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
+        # Keep DFD/depth predictions in normalized disparity [0, 1] to match target_depthmaps.
+        est_dfd = torch.clamp(est_dfd, 0.0, 1.0)
         est_depthmaps = Outputs[2]
-        est_depthmaps = torch.clamp(est_depthmaps, 0.0, 1.0)  # Clamp before denormalization
-        est_depthmaps = est_depthmaps*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
+        est_depthmaps = torch.clamp(est_depthmaps, 0.0, 1.0)
         #est_dfd=est_dfd*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
         #est_depthmaps=est_depthmaps*(norm_max.reshape(-1,1,1,1)-norm_min.reshape(-1,1,1,1))+norm_min.reshape(-1,1,1,1)
 
@@ -878,11 +877,9 @@ class Stereo3D(pl.LightningModule):
         # Clamp mirror decoder outputs to valid range
         left_m = torch.clamp(left_m, 0.0, 1.0)
         est_dfd_m = Outputs_m[1]
-        est_dfd_m = torch.clamp(est_dfd_m, 0.0, 1.0)  # Clamp before denormalization
-        est_dfd_m = est_dfd_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
+        est_dfd_m = torch.clamp(est_dfd_m, 0.0, 1.0)
         est_depthmaps_m = Outputs_m[2]
-        est_depthmaps_m = torch.clamp(est_depthmaps_m, 0.0, 1.0)  # Clamp before denormalization
-        est_depthmaps_m = est_depthmaps_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
+        est_depthmaps_m = torch.clamp(est_depthmaps_m, 0.0, 1.0)
         #est_dfd_m=est_dfd_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
         ##est_depthmaps_m=est_depthmaps_m*(norm_max_m.reshape(-1,1,1,1)-norm_min_m.reshape(-1,1,1,1))+norm_min_m.reshape(-1,1,1,1)
 
