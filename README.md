@@ -133,7 +133,7 @@ This repository contains the official source code, while the model weights are d
 
 ```bash
 # Run inference on captured images
-python run_captured.py --checkpoint path/to/checkpoint.ckpt
+python run_captured.py --checkpoint_path path/to/checkpoint.ckpt
 ```
 
 ## Configuration
