@@ -77,7 +77,7 @@ The project supports three types of Diffractive Optical Elements:
 ```bash
 git clone https://github.com/Lorena-Y-Liu/Learned-Binocular-Optics.git
 cd Learned-Binocular-Optics
-```
+
 
 # Create conda environment
 conda create -n deep_stereo python=3.8
@@ -86,8 +86,8 @@ conda activate deep_stereo
 # Install dependencies
 pip install -r requirements.txt
 pip install git+https://github.com/cheind/pytorch-debayer@v1.0
-```
 
+```
 
 ### Dependencies
 - PyTorch >= 1.9
