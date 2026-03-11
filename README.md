@@ -75,9 +75,9 @@ The project supports three types of Diffractive Optical Elements:
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/YOUR_USERNAME/deep_stereo.git
-cd deep_stereo
+git clone https://github.com/Lorena-Y-Liu/Learned-Binocular-Optics.git
+cd Learned-Binocular-Optics
+```
 
 # Create conda environment
 conda create -n deep_stereo python=3.8
@@ -87,6 +87,7 @@ conda activate deep_stereo
 pip install -r requirements.txt
 pip install git+https://github.com/cheind/pytorch-debayer@v1.0
 ```
+
 
 ### Dependencies
 - PyTorch >= 1.9
@@ -109,6 +110,24 @@ python deepstereo_trainer.py
 # Or specify a config file
 python deepstereo_trainer.py --config configs/config.yaml
 ```
+
+## Pretrained Checkpoint
+
+The pretrained SceneFlow checkpoint is hosted on Hugging Face:
+
+- Hugging Face: [https://huggingface.co/LorenaLiu6/deepstereo-checkpoint-sceneflow](https://huggingface.co/LorenaLiu6/deepstereo-checkpoint-sceneflow)
+
+Checkpoint file:
+
+- `ds-model.ckpt`
+
+After downloading, place the checkpoint at:
+
+```bash
+checkpoints/ds-model.ckpt
+```
+
+This repository contains the official source code, while the model weights are distributed separately through Hugging Face.
 
 ### Inference
 
